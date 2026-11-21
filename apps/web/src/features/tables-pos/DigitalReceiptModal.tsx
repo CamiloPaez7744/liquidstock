@@ -1,11 +1,22 @@
 import { useState } from "react";
 import { Check, CheckCircle2, Copy, X } from "lucide-react";
 import type { OrderItemLine } from "@liquistock/domain";
+import { resolveImageUrl } from "../../infrastructure/api/api-client.js";
 import { formatCOP } from "../../shared/lib/format.js";
 import { haptics } from "../../shared/lib/haptics.js";
 
+export interface ReceiptBarBranding {
+  name: string;
+  legalName?: string | null;
+  taxId?: string | null;
+  logoUrl?: string | null;
+  instagram?: string | null;
+  contactPhone?: string | null;
+}
+
 export interface DigitalReceiptData {
   branchName: string;
+  barBranding?: ReceiptBarBranding;
   tableLabel: string;
   subAccountLabel: string;
   closedAt: string;
@@ -26,10 +37,20 @@ export function DigitalReceiptModal({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const branding = receipt.barBranding;
+  const logoSrc = resolveImageUrl(branding?.logoUrl);
 
   const buildPlainText = () => {
-    const lines = [
-      `*${receipt.branchName}*`,
+    const headerTitle = branding?.name
+      ? `${branding.name} · ${receipt.branchName}`
+      : receipt.branchName;
+    const lines = [`*${headerTitle}*`];
+    if (branding?.legalName) {
+      lines.push(
+        branding.taxId ? `${branding.legalName} · NIT ${branding.taxId}` : branding.legalName,
+      );
+    }
+    lines.push(
       `${receipt.tableLabel} · ${receipt.subAccountLabel}`,
       new Date(receipt.closedAt).toLocaleString("es-CO"),
       "------------------------",
@@ -38,11 +59,12 @@ export function DigitalReceiptModal({
           `${i.quantity}x ${i.productNameSnap} (${i.presentationNameSnap}) - ${formatCOP(i.lineTotal)}`,
       ),
       "------------------------",
-    ];
-    if (receipt.discount > 0) lines.push(`Descuento promos: -${formatCOP(receipt.discount)}`);
+    );
+    if (receipt.discount > 0) lines.push(`Descuento promos/cortesías: -${formatCOP(receipt.discount)}`);
     lines.push(`*TOTAL: ${formatCOP(receipt.total)}*`);
     lines.push(`Estado: ${receipt.paymentSummary}`);
     if (receipt.customerName) lines.push(`Cliente: ${receipt.customerName}`);
+    if (branding?.instagram) lines.push(`Síguenos: ${branding.instagram}`);
     return lines.join("\n");
   };
 
@@ -80,8 +102,26 @@ export function DigitalReceiptModal({
         </div>
 
         <div className="max-h-[60vh] space-y-3 overflow-y-auto p-5">
-          <div className="text-center">
-            <p className="font-display text-base font-bold">{receipt.branchName}</p>
+          <div className="flex flex-col items-center text-center">
+            {logoSrc && (
+              <img
+                src={logoSrc}
+                alt={branding?.name ?? receipt.branchName}
+                className="mb-2 h-12 w-12 rounded-xl object-cover ring-1 ring-white/20"
+              />
+            )}
+            <p className="font-display text-base font-bold">
+              {branding?.name ?? receipt.branchName}
+            </p>
+            {branding?.name && (
+              <p className="text-xs font-medium text-primary">{receipt.branchName}</p>
+            )}
+            {branding?.legalName && (
+              <p className="text-[11px] text-muted-foreground">
+                {branding.legalName}
+                {branding.taxId ? ` · NIT ${branding.taxId}` : ""}
+              </p>
+            )}
             <p className="text-xs text-muted-foreground">
               {new Date(receipt.closedAt).toLocaleString("es-CO")}
             </p>
@@ -116,7 +156,7 @@ export function DigitalReceiptModal({
             </div>
             {receipt.discount > 0 && (
               <div className="flex justify-between text-success">
-                <span>Promociones</span>
+                <span>Promociones / Cortesías</span>
                 <span>-{formatCOP(receipt.discount)}</span>
               </div>
             )}
@@ -129,6 +169,11 @@ export function DigitalReceiptModal({
               <p className="text-xs text-warning">
                 Cliente: {receipt.customerName}
                 {receipt.creditAmount ? ` (Fiado: ${formatCOP(receipt.creditAmount)})` : ""}
+              </p>
+            )}
+            {branding?.instagram && (
+              <p className="pt-1 text-center text-[11px] text-muted-foreground">
+                Síguenos en {branding.instagram}
               </p>
             )}
           </div>
@@ -155,4 +200,3 @@ export function DigitalReceiptModal({
     </div>
   );
 }
-

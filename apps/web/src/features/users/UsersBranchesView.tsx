@@ -1,18 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Building2,
+  Check,
   CheckCircle2,
   CreditCard,
   Globe,
   ImagePlus,
   KeyRound,
+  Pencil,
   Plus,
   Save,
   Shield,
   Store,
   Table2,
+  Trash2,
   UserPlus,
   Users,
+  X,
 } from "lucide-react";
 import type { UserRole } from "@liquistock/domain";
 import {
@@ -99,10 +103,20 @@ export function UsersBranchesView({
   const [newBranchCode, setNewBranchCode] = useState("");
   const [newBranchTables, setNewBranchTables] = useState("6");
 
-  // New table & payment method for current branch
+  // New / Edit / Delete table & payment method for current branch
   const [newTableLabel, setNewTableLabel] = useState("");
+  const [newTableZone, setNewTableZone] = useState("Salón");
+  const [editingTableId, setEditingTableId] = useState<string | null>(null);
+  const [editTableLabel, setEditTableLabel] = useState("");
+  const [editTableZone, setEditTableZone] = useState("Salón");
+  const [confirmDeleteTableId, setConfirmDeleteTableId] = useState<string | null>(null);
+
   const [newPaymentName, setNewPaymentName] = useState("");
   const [newPaymentCash, setNewPaymentCash] = useState(false);
+  const [editingPmId, setEditingPmId] = useState<string | null>(null);
+  const [editPmName, setEditPmName] = useState("");
+  const [editPmCash, setEditPmCash] = useState(false);
+  const [confirmDeletePmId, setConfirmDeletePmId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!activeOrg) return;
@@ -337,7 +351,7 @@ export function UsersBranchesView({
     try {
       await apiFetch(`/api/v1/branches/${branchId}/tables`, {
         method: "POST",
-        body: JSON.stringify({ label: newTableLabel.trim(), zone: "Salón" }),
+        body: JSON.stringify({ label: newTableLabel.trim(), zone: newTableZone.trim() || "Salón" }),
       });
       haptics.success();
       setNewTableLabel("");
@@ -345,6 +359,46 @@ export function UsersBranchesView({
       notify("ok", "Mesa agregada a esta sucursal ✓");
     } catch (err) {
       notify("err", err instanceof Error ? err.message : "Error agregando mesa");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSaveTable = async (tableId: string) => {
+    if (!editTableLabel.trim()) return;
+    setBusy(true);
+    try {
+      await apiFetch(`/api/v1/branches/${branchId}/tables/${tableId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          label: editTableLabel.trim(),
+          zone: editTableZone.trim() || "Salón",
+        }),
+      });
+      haptics.success();
+      setEditingTableId(null);
+      await store.refresh();
+      notify("ok", "Mesa actualizada ✓");
+    } catch (err) {
+      notify("err", err instanceof Error ? err.message : "Error actualizando mesa");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeleteTable = async (tableId: string) => {
+    setBusy(true);
+    try {
+      await apiFetch(`/api/v1/branches/${branchId}/tables/${tableId}`, {
+        method: "DELETE",
+      });
+      haptics.success();
+      setConfirmDeleteTableId(null);
+      await store.refresh();
+      notify("ok", "Mesa eliminada ✓");
+    } catch (err) {
+      haptics.blocked();
+      notify("err", err instanceof Error ? err.message : "No se pudo eliminar la mesa");
     } finally {
       setBusy(false);
     }
@@ -368,6 +422,46 @@ export function UsersBranchesView({
       notify("ok", "Medio de pago agregado ✓");
     } catch (err) {
       notify("err", err instanceof Error ? err.message : "Error agregando medio de pago");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSavePaymentMethod = async (pmId: string) => {
+    if (!editPmName.trim()) return;
+    setBusy(true);
+    try {
+      await apiFetch(`/api/v1/branches/${branchId}/payment-methods/${pmId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: editPmName.trim(),
+          countsAsPhysicalCash: editPmCash,
+        }),
+      });
+      haptics.success();
+      setEditingPmId(null);
+      await store.refresh();
+      notify("ok", "Medio de pago actualizado ✓");
+    } catch (err) {
+      notify("err", err instanceof Error ? err.message : "Error actualizando medio de pago");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeletePaymentMethod = async (pmId: string) => {
+    setBusy(true);
+    try {
+      await apiFetch(`/api/v1/branches/${branchId}/payment-methods/${pmId}`, {
+        method: "DELETE",
+      });
+      haptics.success();
+      setConfirmDeletePmId(null);
+      await store.refresh();
+      notify("ok", "Medio de pago eliminado ✓");
+    } catch (err) {
+      haptics.blocked();
+      notify("err", err instanceof Error ? err.message : "No se pudo eliminar el medio de pago");
     } finally {
       setBusy(false);
     }
@@ -945,23 +1039,124 @@ export function UsersBranchesView({
             <Table2 className="h-5 w-5 text-primary" />
             <h3 className="font-display text-base font-bold">Mesas de Esta Sucursal</h3>
           </div>
-          <div className="flex flex-wrap gap-2">
-            {store.diningTables.map((t) => (
-              <span
-                key={t.id}
-                className="rounded-xl border border-white/10 bg-background/60 px-3 py-1.5 text-xs font-semibold"
-              >
-                {t.label}
-              </span>
-            ))}
+          <div className="space-y-2">
+            {store.diningTables.length === 0 ? (
+              <p className="text-xs text-muted-foreground">Sin mesas configuradas aún.</p>
+            ) : (
+              store.diningTables.map((t) => {
+                const isEditing = editingTableId === t.id;
+                const isConfirming = confirmDeleteTableId === t.id;
+                return (
+                  <div
+                    key={t.id}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-background/60 px-3 py-2 text-xs"
+                  >
+                    {isEditing ? (
+                      <div className="flex flex-1 flex-wrap items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={editTableLabel}
+                          onChange={(e) => setEditTableLabel(e.target.value)}
+                          placeholder="Nombre mesa"
+                          className="min-w-28 flex-1 rounded-lg border border-primary/40 bg-card px-2.5 py-1.5 text-xs font-semibold"
+                        />
+                        <input
+                          type="text"
+                          value={editTableZone}
+                          onChange={(e) => setEditTableZone(e.target.value)}
+                          placeholder="Zona"
+                          className="w-24 rounded-lg border border-white/15 bg-card px-2.5 py-1.5 text-xs"
+                        />
+                        <button
+                          type="button"
+                          disabled={busy || !editTableLabel.trim()}
+                          onClick={() => void handleSaveTable(t.id)}
+                          className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-success text-primary-foreground"
+                          title="Guardar"
+                        >
+                          <Check className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingTableId(null)}
+                          className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-secondary text-muted-foreground"
+                          title="Cancelar"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="min-w-0">
+                          <span className="font-semibold text-foreground">{t.label}</span>
+                          {t.zone && (
+                            <span className="ml-2 rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                              {t.zone}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            title="Editar mesa"
+                            onClick={() => {
+                              haptics.tap();
+                              setConfirmDeleteTableId(null);
+                              setEditingTableId(t.id);
+                              setEditTableLabel(t.label);
+                              setEditTableZone(t.zone ?? "Salón");
+                            }}
+                            className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-secondary text-foreground"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          {isConfirming ? (
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleDeleteTable(t.id)}
+                              className="press-response rounded-lg bg-destructive px-2.5 py-1.5 text-[11px] font-bold text-white"
+                            >
+                              ¿Eliminar?
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={busy}
+                              title="Eliminar mesa"
+                              onClick={() => {
+                                haptics.tap();
+                                setEditingTableId(null);
+                                setConfirmDeleteTableId(t.id);
+                              }}
+                              className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-destructive/15 text-destructive"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })
+            )}
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <input
               type="text"
               placeholder="Ej. Mesa 7, Barra 2, Terraza 1"
               value={newTableLabel}
               onChange={(e) => setNewTableLabel(e.target.value)}
-              className="flex-1 rounded-xl border border-white/15 bg-background px-3 py-2 text-xs"
+              className="min-w-40 flex-1 rounded-xl border border-white/15 bg-background px-3 py-2 text-xs"
+            />
+            <input
+              type="text"
+              placeholder="Zona (Salón)"
+              value={newTableZone}
+              onChange={(e) => setNewTableZone(e.target.value)}
+              className="w-28 rounded-xl border border-white/15 bg-background px-3 py-2 text-xs"
             />
             <button
               type="button"
@@ -979,15 +1174,112 @@ export function UsersBranchesView({
             <CreditCard className="h-5 w-5 text-success" />
             <h3 className="font-display text-base font-bold">Medios de Pago Configurados</h3>
           </div>
-          <div className="flex flex-wrap gap-2">
-            {store.paymentMethods.map((pm) => (
-              <span
-                key={pm.id}
-                className="rounded-xl border border-white/10 bg-background/60 px-3 py-1.5 text-xs font-semibold"
-              >
-                {pm.name} {pm.countsAsPhysicalCash ? "(Efectivo)" : ""}
-              </span>
-            ))}
+          <div className="space-y-2">
+            {store.paymentMethods.map((pm) => {
+              const isEditing = editingPmId === pm.id;
+              const isConfirming = confirmDeletePmId === pm.id;
+              const canDelete = store.paymentMethods.length > 1;
+              return (
+                <div
+                  key={pm.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-background/60 px-3 py-2 text-xs"
+                >
+                  {isEditing ? (
+                    <div className="flex flex-1 flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        value={editPmName}
+                        onChange={(e) => setEditPmName(e.target.value)}
+                        placeholder="Nombre medio de pago"
+                        className="min-w-32 flex-1 rounded-lg border border-success/40 bg-card px-2.5 py-1.5 text-xs font-semibold"
+                      />
+                      <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={editPmCash}
+                          onChange={(e) => setEditPmCash(e.target.checked)}
+                          className="accent-success"
+                        />
+                        Efectivo
+                      </label>
+                      <button
+                        type="button"
+                        disabled={busy || !editPmName.trim()}
+                        onClick={() => void handleSavePaymentMethod(pm.id)}
+                        className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-success text-primary-foreground"
+                        title="Guardar"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingPmId(null)}
+                        className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-secondary text-muted-foreground"
+                        title="Cancelar"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="min-w-0">
+                        <span className="font-semibold text-foreground">{pm.name}</span>
+                        {pm.countsAsPhysicalCash && (
+                          <span className="ml-2 rounded bg-success/15 px-1.5 py-0.5 text-[10px] font-bold text-success">
+                            Efectivo físico
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          title="Editar medio de pago"
+                          onClick={() => {
+                            haptics.tap();
+                            setConfirmDeletePmId(null);
+                            setEditingPmId(pm.id);
+                            setEditPmName(pm.name);
+                            setEditPmCash(pm.countsAsPhysicalCash);
+                          }}
+                          className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-secondary text-foreground"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        {isConfirming ? (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void handleDeletePaymentMethod(pm.id)}
+                            className="press-response rounded-lg bg-destructive px-2.5 py-1.5 text-[11px] font-bold text-white"
+                          >
+                            ¿Eliminar?
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={busy || !canDelete}
+                            title={
+                              canDelete
+                                ? "Eliminar medio de pago"
+                                : "Debe quedar al menos un medio de pago activo"
+                            }
+                            onClick={() => {
+                              haptics.tap();
+                              setEditingPmId(null);
+                              setConfirmDeletePmId(pm.id);
+                            }}
+                            className="press-response flex h-8 w-8 items-center justify-center rounded-lg bg-destructive/15 text-destructive disabled:opacity-35"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <input
