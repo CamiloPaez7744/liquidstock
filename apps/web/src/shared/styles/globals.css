@@ -68,6 +68,110 @@
     background: oklch(0.5 0.05 260 / 0.3);
     border-radius: 999px;
   }
+
+  /* === Desplegables (<select>) estilizados acorde al tema oscuro OKLCH === */
+  select {
+    appearance: none;
+    -webkit-appearance: none;
+    color-scheme: dark;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2388d8e6' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.65rem center;
+    background-size: 0.95rem 0.95rem;
+    padding-right: 2.15rem !important;
+    transition:
+      border-color 140ms var(--ease-out-fluid),
+      background-color 140ms var(--ease-out-fluid),
+      box-shadow 140ms var(--ease-out-fluid);
+  }
+
+  select:hover:not(:disabled) {
+    border-color: oklch(0.82 0.15 195 / 0.5);
+  }
+
+  select:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px oklch(0.82 0.15 195 / 0.2);
+  }
+
+  select option,
+  select optgroup {
+    background-color: #161b2f;
+    color: #f3f6fb;
+    font-weight: 500;
+  }
+
+  /* Popover moderno de desplegables (Chrome / Edge modernos) */
+  @supports (appearance: base-select) {
+    select,
+    ::picker(select) {
+      appearance: base-select;
+    }
+
+    select {
+      background-image: none;
+      padding-right: 0.75rem !important;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    select::picker-icon {
+      color: var(--color-primary);
+      font-size: 0.72em;
+      margin-inline-start: auto;
+      transition: transform 160ms var(--ease-out-fluid);
+    }
+
+    select:open::picker-icon {
+      transform: rotate(180deg);
+    }
+
+    ::picker(select) {
+      background: oklch(0.185 0.042 264 / 0.98);
+      border: 1px solid oklch(1 0 0 / 0.14);
+      border-radius: 1rem;
+      padding: 0.35rem;
+      margin-block: 0.35rem;
+      box-shadow:
+        0 18px 42px -10px oklch(0 0 0 / 0.7),
+        0 0 0 1px oklch(0.82 0.15 195 / 0.12);
+      color: var(--color-foreground);
+      min-width: anchor-size(width);
+    }
+
+    select option {
+      background: transparent;
+      color: var(--color-foreground);
+      padding: 0.55rem 0.75rem;
+      border-radius: 0.65rem;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      gap: 0.5rem;
+      transition: background-color 120ms ease;
+    }
+
+    select option:hover {
+      background: oklch(0.82 0.15 195 / 0.14);
+      color: var(--color-foreground);
+    }
+
+    select option:checked {
+      background: oklch(0.82 0.15 195 / 0.22);
+      color: var(--color-primary);
+      font-weight: 700;
+    }
+
+    select option::checkmark {
+      color: var(--color-primary);
+      font-size: 0.85em;
+      order: 1;
+      margin-inline-start: auto;
+    }
+  }
 }
 
 /* === Feedback táctil inmediato para celular y tablet (<100ms) === */

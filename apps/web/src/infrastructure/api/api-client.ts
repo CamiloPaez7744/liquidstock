@@ -92,11 +92,30 @@ export function getAuthToken(): string | null {
 }
 
 export function resolveImageUrl(imageUrl?: string | null): string | null {
-  if (!imageUrl) return null;
+  if (!imageUrl || imageUrl.startsWith("icon:")) return null;
   if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://") || imageUrl.startsWith("data:")) {
     return imageUrl;
   }
   return `${API_BASE_URL}${imageUrl}`;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly details: Record<string, unknown> | null;
+
+  constructor(
+    message: string,
+    status: number,
+    code: string | null = null,
+    details: Record<string, unknown> | null = null,
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -127,14 +146,21 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
+    let code: string | null = null;
+    let details: Record<string, unknown> | null = null;
     try {
-      const data = (await res.json()) as { message?: string; error?: string };
-      message = data.message || data.error || message;
+      const data = (await res.json()) as Record<string, unknown>;
+      details = data;
+      code = typeof data.error === "string" ? data.error : null;
+      message =
+        (typeof data.message === "string" && data.message) ||
+        (typeof data.error === "string" && data.error) ||
+        message;
     } catch {
       const text = await res.text().catch(() => "");
       if (text) message = text;
     }
-    throw new Error(message);
+    throw new ApiError(message, res.status, code, details);
   }
   return (await res.json()) as T;
 }
