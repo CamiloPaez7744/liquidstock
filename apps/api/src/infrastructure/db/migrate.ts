@@ -2,7 +2,7 @@ import "dotenv/config";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pool } from "./pool.js";
+import { closeDb, db, dbEngineLabel, withTransaction } from "./pool.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const migrationsDir = path.resolve(__dirname, "../../../migrations");
@@ -12,7 +12,7 @@ async function runMigrations() {
     .filter((f) => f.endsWith(".sql"))
     .sort();
 
-  await pool.query(`
+  await db.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       filename text PRIMARY KEY,
       applied_at timestamptz NOT NULL DEFAULT now()
@@ -20,31 +20,23 @@ async function runMigrations() {
   `);
 
   for (const filename of files) {
-    const existing = await pool.query(
+    const existing = await db.query(
       "SELECT 1 FROM schema_migrations WHERE filename = $1",
       [filename],
     );
-    if (existing.rowCount && existing.rowCount > 0) {
+    if (existing.rows.length > 0) {
       continue;
     }
 
     const sql = await fs.readFile(path.join(migrationsDir, filename), "utf8");
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query(sql);
+    await withTransaction(async (client) => {
+      await client.exec(sql);
       await client.query("INSERT INTO schema_migrations (filename) VALUES ($1)", [filename]);
-      await client.query("COMMIT");
-      console.log(`[migrate] Applied ${filename}`);
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
+    console.log(`[migrate] Applied ${filename} on ${dbEngineLabel}`);
   }
 
-  await pool.end();
+  await closeDb();
   console.log("[migrate] All migrations up to date.");
 }
 
@@ -52,4 +44,3 @@ runMigrations().catch((err) => {
   console.error("[migrate] Failed:", err);
   process.exit(1);
 });
-

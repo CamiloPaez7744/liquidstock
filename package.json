@@ -9,7 +9,9 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
-    "db:migrate": "pnpm --filter @liquistock/api db:migrate"
+    "db:migrate": "pnpm --filter @liquistock/api db:migrate",
+    "db:seed": "pnpm --filter @liquistock/api db:seed",
+    "db:reset": "pnpm --filter @liquistock/api db:reset"
   },
   "devDependencies": {
     "typescript": "^5.8.2"

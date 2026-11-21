@@ -1,30 +1,67 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   BarChart3,
   Beer,
+  Building2,
   CloudOff,
+  LogOut,
   Receipt,
   Settings2,
+  Users,
   UtensilsCrossed,
   Wifi,
 } from "lucide-react";
+import {
+  apiFetch,
+  clearStoredSession,
+  getStoredSession,
+  resolveImageUrl,
+  saveStoredSession,
+  type OrganizationProfile,
+  type StoredAuthSession,
+  type StoredAuthUser,
+} from "./infrastructure/api/api-client.js";
+import { localDb } from "./infrastructure/storage/dexie/db.js";
 import { syncEngine, type SyncStatusSnapshot } from "./infrastructure/sync/sync-engine.js";
+import { useLiquiStock } from "./infrastructure/sync/useLiquiStock.js";
+import { AuthScreen } from "./features/auth/AuthScreen.js";
+import { CashShiftView } from "./features/cash-shift/CashShiftView.js";
+import { InventoryView } from "./features/inventory/InventoryView.js";
+import { KpisView } from "./features/kpis/KpisView.js";
+import { BarConfigView } from "./features/settings/BarConfigView.js";
+import { SuperAdminDashboard } from "./features/superadmin/SuperAdminDashboard.js";
+import { TablesPosView } from "./features/tables-pos/TablesPosView.js";
+import { UsersBranchesView } from "./features/users/UsersBranchesView.js";
 import { haptics } from "./shared/lib/haptics.js";
 
-type PosSection = "pos" | "inventory" | "cash" | "kpis" | "settings";
+type PosSection = "pos" | "inventory" | "cash" | "kpis" | "settings" | "users";
 
-const DEMO_BRANCH_ID = "01950000-0000-7000-8000-000000000001";
-
-const NAV_ITEMS: Array<{ id: PosSection; label: string; icon: typeof Beer }> = [
-  { id: "pos", label: "Mesas & POS", icon: UtensilsCrossed },
-  { id: "inventory", label: "Barriles & Stock", icon: Beer },
-  { id: "cash", label: "Caja & Cierre", icon: Receipt },
-  { id: "kpis", label: "KPIs", icon: BarChart3 },
-  { id: "settings", label: "Config Bar", icon: Settings2 },
+const NAV_ITEMS: Array<{
+  id: PosSection;
+  label: string;
+  shortLabel: string;
+  icon: typeof Beer;
+  roles: Array<"admin" | "cashier" | "waiter">;
+}> = [
+  { id: "pos", label: "Mesas & POS", shortLabel: "POS", icon: UtensilsCrossed, roles: ["admin", "cashier", "waiter"] },
+  { id: "inventory", label: "Barriles & Stock", shortLabel: "Stock", icon: Beer, roles: ["admin", "cashier"] },
+  { id: "cash", label: "Caja & Cierre", shortLabel: "Caja", icon: Receipt, roles: ["admin", "cashier"] },
+  { id: "kpis", label: "KPIs", shortLabel: "KPIs", icon: BarChart3, roles: ["admin"] },
+  { id: "settings", label: "Config Bar", shortLabel: "Config", icon: Settings2, roles: ["admin"] },
+  { id: "users", label: "Mi Bar & Equipo", shortLabel: "Mi Bar", icon: Users, roles: ["admin"] },
 ];
 
-export function App() {
+function AuthenticatedPosShell({
+  session,
+  onUpdateSession,
+  onLogout,
+}: {
+  session: StoredAuthSession;
+  onUpdateSession: (next: StoredAuthSession) => void;
+  onLogout: () => void;
+}) {
   const [section, setSection] = useState<PosSection>("pos");
+  const [organizations, setOrganizations] = useState<OrganizationProfile[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatusSnapshot>({
     connectivity: "online",
     pendingCount: 0,
@@ -32,95 +69,263 @@ export function App() {
     wsConnected: false,
   });
 
+  const activeBranchId = session.activeBranchId ?? session.user.memberships[0]?.branchId ?? "";
+  const activeMembership =
+    session.user.memberships.find((m) => m.branchId === activeBranchId) ??
+    session.user.memberships[0];
+  const activeRole = activeMembership?.role ?? "waiter";
+  const isAdmin = activeRole === "admin";
+  const isOffline = syncStatus.connectivity === "offline";
+
+  const store = useLiquiStock(activeBranchId, session.user.userId);
+
   useEffect(() => {
+    if (!activeBranchId) return;
     const unsub = syncEngine.subscribe(setSyncStatus);
-    const stop = syncEngine.start(DEMO_BRANCH_ID);
+    const stop = syncEngine.start(activeBranchId);
     return () => {
       unsub();
       stop();
     };
+  }, [activeBranchId]);
+
+  const refreshProfile = useCallback(async () => {
+    try {
+      const me = await apiFetch<{
+        user: StoredAuthUser;
+        organizations: OrganizationProfile[];
+      }>("/api/v1/auth/me");
+      setOrganizations(me.organizations ?? []);
+      const validBranch = me.user.memberships.some((m) => m.branchId === session.activeBranchId)
+        ? session.activeBranchId
+        : (me.user.memberships[0]?.branchId ?? session.activeBranchId);
+      const updated: StoredAuthSession = {
+        ...session,
+        user: me.user,
+        activeBranchId: validBranch,
+      };
+      saveStoredSession(updated);
+      onUpdateSession(updated);
+    } catch {
+      // Offline: keep cached session
+    }
+  }, [session, onUpdateSession]);
+
+  useEffect(() => {
+    void refreshProfile();
   }, []);
 
-  const isOffline = syncStatus.connectivity === "offline";
+  const visibleNav = NAV_ITEMS.filter((item) => item.roles.includes(activeRole));
+  const currentSection = visibleNav.some((n) => n.id === section) ? section : "pos";
+
+  const handleSwitchBranch = (nextBranchId: string) => {
+    const updated: StoredAuthSession = { ...session, activeBranchId: nextBranchId };
+    saveStoredSession(updated);
+    onUpdateSession(updated);
+  };
+
+  const activeOrg = organizations.find((o) => o.id === activeMembership?.organizationId);
+  const barTitle = activeOrg?.name ?? activeMembership?.organizationName ?? "LiquiStock";
+  const barLogo = resolveImageUrl(activeOrg?.logoUrl ?? activeMembership?.organizationLogoUrl);
 
   return (
-    <div className="flex h-full flex-col">
-      {/* Cabecera nocturna de baja fricción con semáforo de resiliencia Offline-First */}
-      <header className="material-thick z-20 flex items-center justify-between gap-3 px-4 py-3">
-        <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-primary/15 text-primary ring-1 ring-primary/35">
-            <Beer className="h-6 w-6" />
-          </div>
-          <div>
-            <h1 className="font-display text-lg font-bold tracking-tight">LiquiStock</h1>
-            <p className="text-xs text-muted-foreground">Sucursal Principal · Offline-First POS</p>
+    <div className="flex h-dvh flex-col">
+      {/* Cabecera con Logo real del bar, selector multi-sede, rol real y cerrar sesión */}
+      <header className="material-thick safe-top z-20 flex shrink-0 items-center justify-between gap-2 border-b px-3 pb-2 sm:px-4 sm:py-2.5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          {barLogo ? (
+            <img
+              src={barLogo}
+              alt={barTitle}
+              className="h-9 w-9 shrink-0 rounded-xl object-cover ring-1 ring-white/20 sm:h-10 sm:w-10"
+            />
+          ) : (
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/15 text-primary ring-1 ring-primary/30 sm:h-10 sm:w-10">
+              <Beer className="h-5 w-5" />
+            </div>
+          )}
+          <div className="min-w-0">
+            <h1 className="truncate font-display text-sm font-bold leading-tight tracking-tight sm:text-base">
+              {barTitle}
+            </h1>
+            {session.user.memberships.length > 1 ? (
+              <label className="flex items-center gap-1 text-[11px] text-primary">
+                <Building2 className="h-3 w-3 shrink-0" />
+                <select
+                  value={activeBranchId}
+                  onChange={(e) => handleSwitchBranch(e.target.value)}
+                  className="max-w-40 truncate bg-transparent text-[11px] font-semibold text-primary focus:outline-none sm:max-w-none"
+                >
+                  {session.user.memberships.map((m) => (
+                    <option key={m.branchId} value={m.branchId} className="bg-card text-foreground">
+                      {m.organizationName !== barTitle
+                        ? `${m.organizationName} · ${m.branchName}`
+                        : m.branchName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <p className="hidden truncate text-[11px] text-muted-foreground sm:block">
+                {activeMembership?.branchName ?? store.branch?.name ?? "Sucursal"}
+              </p>
+            )}
           </div>
         </div>
 
-        {/* Semáforo no intrusivo: transmite seguridad ante cortes de red o luz */}
-        <div
-          className={`flex items-center gap-2 rounded-full px-3.5 py-2 text-xs font-semibold ${
-            isOffline
-              ? "bg-warning/15 text-warning ring-1 ring-warning/40"
-              : "bg-success/15 text-success ring-1 ring-success/35"
-          }`}
-        >
-          {isOffline ? <CloudOff className="h-4 w-4" /> : <Wifi className="h-4 w-4" />}
-          <span>
-            {isOffline
-              ? `Modo Local Seguro (${syncStatus.pendingCount} pend.)`
-              : syncStatus.wsConnected
-                ? "Sincronizado en vivo"
-                : "En línea (Outbox listo)"}
-          </span>
+        <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+          <div className="hidden items-center gap-1.5 rounded-full bg-secondary/80 px-3 py-1.5 text-xs font-semibold sm:flex">
+            <span className="max-w-28 truncate">{session.user.fullName}</span>
+            <span className="rounded-full bg-primary/20 px-1.5 py-0.5 text-[10px] font-bold uppercase text-primary">
+              {activeRole === "admin" ? "Admin" : activeRole === "cashier" ? "Caja" : "Mesero"}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void syncEngine.flushOutbox(activeBranchId)}
+            title="Estado de sincronización"
+            className={`press-response flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-xs font-semibold ${
+              isOffline
+                ? "bg-warning/15 text-warning ring-1 ring-warning/40"
+                : "bg-success/15 text-success ring-1 ring-success/35"
+            }`}
+          >
+            {isOffline ? <CloudOff className="h-3.5 w-3.5" /> : <Wifi className="h-3.5 w-3.5" />}
+            <span className="hidden sm:inline">
+              {isOffline
+                ? `Local (${syncStatus.pendingCount})`
+                : syncStatus.wsConnected
+                  ? syncStatus.pendingCount > 0
+                    ? `Sync (${syncStatus.pendingCount})`
+                    : "En vivo"
+                  : "En línea"}
+            </span>
+            <span className="sm:hidden">
+              {isOffline ? `${syncStatus.pendingCount}` : syncStatus.wsConnected ? "Vivo" : "OK"}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onLogout}
+            title="Cerrar sesión"
+            className="press-response flex h-9 w-9 items-center justify-center rounded-full bg-secondary/80 text-muted-foreground hover:text-destructive"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </header>
 
-      {/* Área de trabajo principal */}
-      <main className="flex-1 overflow-y-auto p-4 md:p-6">
-        <div className="mx-auto max-w-5xl space-y-4">
-          <section className="solid-card rounded-2xl p-6">
-            <span className="inline-block rounded-full bg-primary/15 px-3 py-1 text-xs font-semibold text-primary">
-              Fase 0 Completada · Núcleo Clean Architecture + Offline-First
-            </span>
-            <h2 className="mt-3 font-display text-2xl font-bold">
-              {NAV_ITEMS.find((n) => n.id === section)?.label}
-            </h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Motor compartido <code className="text-foreground">@liquistock/domain</code> activo con
-              conversión de barriles/jirafas/shots, fórmula de merma por espuma, sincronización de
-              agotados y horarios de aliados, IndexedDB local (<code className="text-foreground">Dexie.js</code>)
-              y sincronización multi-tablet por WebSocket + Outbox idempotente.
-            </p>
-          </section>
+      {/* Área principal */}
+      <main
+        className={`min-h-0 flex-1 ${
+          currentSection === "pos" ? "overflow-hidden p-0 lg:p-4" : "overflow-y-auto p-3 sm:p-5"
+        }`}
+      >
+        <div
+          className={`mx-auto h-full max-w-7xl ${currentSection === "pos" ? "flex flex-col" : ""}`}
+        >
+          {store.loading && store.diningTables.length === 0 && store.menuProducts.length === 0 ? (
+            <div className="m-4 rounded-2xl bg-card p-8 text-center text-sm text-muted-foreground">
+              Sincronizando datos de {activeMembership?.branchName ?? "tu sucursal"}...
+            </div>
+          ) : currentSection === "pos" ? (
+            <TablesPosView
+              store={store}
+              isAdmin={isAdmin}
+              onGoToInventory={() => setSection("inventory")}
+            />
+          ) : currentSection === "inventory" ? (
+            <InventoryView store={store} branchId={activeBranchId} />
+          ) : currentSection === "cash" ? (
+            <CashShiftView store={store} branchId={activeBranchId} />
+          ) : currentSection === "kpis" ? (
+            <KpisView store={store} branchId={activeBranchId} />
+          ) : currentSection === "settings" ? (
+            <BarConfigView store={store} branchId={activeBranchId} />
+          ) : (
+            <UsersBranchesView
+              store={store}
+              branchId={activeBranchId}
+              memberships={session.user.memberships}
+              organizations={organizations}
+              currentUserId={session.user.userId}
+              onProfileOrBranchesChanged={refreshProfile}
+            />
+          )}
         </div>
       </main>
 
-      {/* Barra inferior táctil (targets >= 56px para operación rápida en tablets y celulares) */}
-      <nav className="material-thick z-20 grid grid-cols-5 gap-2 px-3 py-2">
-        {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
-          const active = section === id;
-          return (
-            <button
-              key={id}
-              type="button"
-              onClick={() => {
-                haptics.tap();
-                setSection(id);
-              }}
-              className={`press-response flex min-h-14 flex-col items-center justify-center gap-1 rounded-xl px-2 text-xs font-semibold ${
-                active
-                  ? "bg-primary text-primary-foreground shadow-lg"
-                  : "bg-secondary/60 text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              <Icon className="h-5 w-5" />
-              <span className="truncate">{label}</span>
-            </button>
-          );
-        })}
-      </nav>
+      {/* Navegación inferior táctil (si es mesero y solo tiene POS, no estorba la pantalla!) */}
+      {visibleNav.length > 1 && (
+        <nav
+          className="material-thick safe-bottom z-20 grid shrink-0 gap-1 border-t px-2 pt-1.5 sm:gap-2 sm:px-3 sm:pt-2"
+          style={{ gridTemplateColumns: `repeat(${visibleNav.length}, minmax(0, 1fr))` }}
+        >
+          {visibleNav.map(({ id, label, shortLabel, icon: Icon }) => {
+            const active = currentSection === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  haptics.tap();
+                  setSection(id);
+                }}
+                className={`press-response flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-xl px-1 text-[11px] font-semibold sm:min-h-13 sm:gap-1 sm:text-xs ${
+                  active
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
+                }`}
+              >
+                <Icon className="h-5 w-5" />
+                <span className="truncate sm:hidden">{shortLabel}</span>
+                <span className="hidden truncate sm:inline">{label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      )}
     </div>
   );
 }
 
+export function App() {
+  const [session, setSession] = useState<StoredAuthSession | null>(() => getStoredSession());
+
+  useEffect(() => {
+    const onUnauthorized = () => {
+      clearStoredSession();
+      setSession(null);
+    };
+    window.addEventListener("liquistock:unauthorized", onUnauthorized);
+    return () => window.removeEventListener("liquistock:unauthorized", onUnauthorized);
+  }, []);
+
+  const handleLogout = async () => {
+    clearStoredSession();
+    const pending = await localDb.syncOutbox.where("syncStatus").equals("pending").count();
+    if (pending === 0) {
+      await localDb.delete();
+      await localDb.open();
+    }
+    setSession(null);
+  };
+
+  if (!session) {
+    return <AuthScreen onAuthenticated={setSession} />;
+  }
+
+  if (session.user.isSuperAdmin) {
+    return <SuperAdminDashboard user={session.user} onLogout={() => void handleLogout()} />;
+  }
+
+  return (
+    <AuthenticatedPosShell
+      session={session}
+      onUpdateSession={setSession}
+      onLogout={() => void handleLogout()}
+    />
+  );
+}

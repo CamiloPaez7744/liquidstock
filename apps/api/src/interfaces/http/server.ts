@@ -9,9 +9,19 @@ import Fastify from "fastify";
 import { z } from "zod";
 import type { OfflineSyncCommand } from "@liquistock/domain";
 import { ProcessSyncBatchUseCase } from "../../application/sync/process-sync-batch.use-case.js";
-import { pool } from "../../infrastructure/db/pool.js";
+import {
+  extractBearerToken,
+  loadAuthContextFromToken,
+  requireBranchRole,
+} from "../../infrastructure/auth/auth-guard.js";
+import { db, dbEngineLabel } from "../../infrastructure/db/pool.js";
 import { PostgresSyncRepository } from "../../infrastructure/db/postgres-sync.repository.js";
 import { branchHub } from "../../infrastructure/realtime/branch-hub.js";
+import { registerAdminCatalogRoutes } from "./routes/admin-catalog.routes.js";
+import { registerAuthAndUsersRoutes } from "./routes/auth-users.routes.js";
+import { registerBootstrapRoutes } from "./routes/bootstrap.routes.js";
+import { registerInventoryRoutes } from "./routes/inventory.routes.js";
+import { registerShiftsAndKpisRoutes } from "./routes/shifts-kpis.routes.js";
 
 const syncBatchSchema = z.object({
   branchId: z.string().uuid(),
@@ -28,6 +38,8 @@ const syncBatchSchema = z.object({
         "ADD_ORDER_ITEM",
         "VOID_ORDER_ITEM",
         "MOVE_ORDER_ITEM",
+        "ADJUST_ORDER_ITEM_PRICE",
+        "APPLY_PROMOTION_TO_SUB_ACCOUNT",
         "RECORD_PAYMENT",
         "CHARGE_SUB_ACCOUNT_CREDIT",
         "CLOSE_CASH_SHIFT",
@@ -47,9 +59,11 @@ export async function buildServer() {
   await app.register(cors, {
     origin: process.env.CORS_ORIGIN?.split(",") ?? true,
     credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   });
   await app.register(multipart, {
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max product image
+    limits: { fileSize: 5 * 1024 * 1024 },
   });
   await app.register(fastifyStatic, {
     root: uploadDir,
@@ -61,16 +75,33 @@ export async function buildServer() {
 
   app.get("/health", async () => {
     try {
-      await pool.query("SELECT 1");
-      return { status: "healthy", database: "connected", service: "liquistock-api" };
+      await db.query("SELECT 1");
+      return {
+        status: "healthy",
+        database: "connected",
+        engine: dbEngineLabel,
+        service: "liquistock-api",
+      };
     } catch {
-      return { status: "degraded", database: "unreachable", service: "liquistock-api" };
+      return {
+        status: "degraded",
+        database: "unreachable",
+        engine: dbEngineLabel,
+        service: "liquistock-api",
+      };
     }
   });
 
-  // Real-time multi-tablet WebSocket channel scoped by branch
-  app.get("/ws/:branchId", { websocket: true }, (socket, req) => {
+  // Authenticated Real-time multi-tablet WebSocket channel scoped by branch
+  app.get("/ws/:branchId", { websocket: true }, async (socket, req) => {
     const { branchId } = req.params as { branchId: string };
+    const token = extractBearerToken(req);
+    const auth = token ? await loadAuthContextFromToken(token) : null;
+    if (!auth || !auth.memberships.some((m) => m.branchId === branchId)) {
+      socket.close(1008, "Unauthorized");
+      return;
+    }
+
     branchHub.subscribe(branchId, socket);
     socket.send(
       JSON.stringify({
@@ -81,7 +112,7 @@ export async function buildServer() {
     );
   });
 
-  // Idempotent Offline Outbox Sync endpoint
+  // Authenticated Idempotent Offline Outbox Sync endpoint
   app.post("/api/v1/sync/batch", async (request, reply) => {
     const parsed = syncBatchSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -91,9 +122,23 @@ export async function buildServer() {
       });
     }
 
-    const result = await syncUseCase.execute(parsed.data.commands as OfflineSyncCommand[]);
+    const auth = await requireBranchRole(request, reply, parsed.data.branchId, [
+      "admin",
+      "cashier",
+      "waiter",
+    ]);
+    if (!auth) return;
 
-    if (result.receipts.some((r) => r.status === "applied")) {
+    // Enforce server-authenticated actor identity on every command
+    const authenticatedCommands: OfflineSyncCommand[] = parsed.data.commands.map((c) => ({
+      ...(c as OfflineSyncCommand),
+      branchId: parsed.data.branchId,
+      userId: auth.userId,
+    }));
+
+    const result = await syncUseCase.execute(authenticatedCommands);
+
+    if (result.receipts.some((r) => r.status === "applied" || r.status === "conflict_flagged")) {
       branchHub.broadcast({
         type: "SYNC_BATCH_APPLIED",
         branchId: parsed.data.branchId,
@@ -106,6 +151,12 @@ export async function buildServer() {
     return reply.send(result);
   });
 
+  await registerAuthAndUsersRoutes(app);
+  await registerBootstrapRoutes(app);
+  await registerAdminCatalogRoutes(app, uploadDir);
+  await registerInventoryRoutes(app);
+  await registerShiftsAndKpisRoutes(app);
+
   return app;
 }
 
@@ -116,4 +167,3 @@ if (isMain) {
   const server = await buildServer();
   await server.listen({ port, host });
 }
-

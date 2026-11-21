@@ -183,6 +183,7 @@ export interface PaymentMethod {
 
 export type PromotionRuleType = "bxgy" | "percentage_discount" | "fixed_discount" | "fixed_price";
 export type PromotionScopeType = "category" | "product" | "presentation" | "order";
+export type PromotionApplicationMode = "automatic" | "manual_at_checkout";
 
 export interface PromotionRule {
   id: string;
@@ -190,18 +191,23 @@ export interface PromotionRule {
   name: string;
   ruleType: PromotionRuleType;
   scopeType: PromotionScopeType;
+  applicationMode?: PromotionApplicationMode;
   targetId?: string | null;
   /** ISO days: 1=Mon .. 7=Sun */
   daysOfWeek?: number[] | null;
   /** "HH:MM" local time */
   startTime?: string | null;
   endTime?: string | null;
+  /** Optional calendar date range "YYYY-MM-DD" (e.g. March Women's Month: 2026-03-01 .. 2026-03-31) */
+  validFrom?: string | null;
+  validUntil?: string | null;
   config: {
     buyQty?: number;
     payQty?: number;
     percent?: number;
     fixedAmount?: number;
     fixedUnitPrice?: number;
+    minQuantity?: number;
   };
   priority: number;
   isStackable: boolean;
@@ -225,6 +231,7 @@ export interface OrderItemLine {
   promotionRuleId?: string | null;
   discountAmount: number;
   lineTotal: number;
+  adjustmentReason?: string | null;
   status: "active" | "voided";
 }
 
@@ -234,6 +241,8 @@ export type SyncCommandType =
   | "ADD_ORDER_ITEM"
   | "VOID_ORDER_ITEM"
   | "MOVE_ORDER_ITEM"
+  | "ADJUST_ORDER_ITEM_PRICE"
+  | "APPLY_PROMOTION_TO_SUB_ACCOUNT"
   | "RECORD_PAYMENT"
   | "CHARGE_SUB_ACCOUNT_CREDIT"
   | "CLOSE_CASH_SHIFT";

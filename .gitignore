@@ -6,6 +6,7 @@ build/
 *.log
 coverage/
 uploads/
+data/
 .DS_Store
 Thumbs.db
 

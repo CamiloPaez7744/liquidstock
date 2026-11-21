@@ -6,8 +6,10 @@ import {
   evaluateCreditRequest,
   evaluateLinePromotion,
   evaluatePresentationAvailability,
+  evaluateSubAccountPromotion,
   explodePresentationSale,
   generateUuidV7,
+  isPromotionEligibleAt,
   type Ally,
   type Customer,
   type InventoryItem,
@@ -405,6 +407,70 @@ describe("LiquiStock Domain Core", () => {
     const id2 = generateUuidV7(1700000005000);
     expect(id1).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(id2 > id1).toBe(true);
+  });
+
+  it("evaluates accumulated sub-account promos: '10+1 gratis' across multiple rounds & March Women's Month 3x2", () => {
+    // 1) Toma 10, la 11 es gratis (buyQty=11, payQty=10) across 3 separate beer rounds
+    const rule10Plus1: PromotionRule = {
+      id: "promo-10-plus-1",
+      branchId: "b1",
+      name: "Toma 10, la 11 es gratis",
+      ruleType: "bxgy",
+      scopeType: "category",
+      applicationMode: "automatic",
+      targetId: "cat-beer",
+      config: { buyQty: 11, payQty: 10 },
+      priority: 10,
+      isStackable: false,
+      isActive: true,
+    };
+
+    const rounds = [
+      { id: "l1", categoryId: "cat-beer", menuProductId: "p1", presentationId: "pr1", unitPrice: 14000, quantity: 4 },
+      { id: "l2", categoryId: "cat-beer", menuProductId: "p1", presentationId: "pr1", unitPrice: 14000, quantity: 4 },
+      { id: "l3", categoryId: "cat-beer", menuProductId: "p1", presentationId: "pr1", unitPrice: 14000, quantity: 3 },
+    ];
+    const res11 = evaluateSubAccountPromotion(rule10Plus1, rounds);
+    expect(res11.totalDiscount).toBe(14000); // 11 beers accumulated -> 1 free!
+
+    // 2) Marzo Mes de la Mujer 3x2 (manual_at_checkout, date-scoped March only)
+    const womensMonth: PromotionRule = {
+      id: "promo-march-3x2",
+      branchId: "b1",
+      name: "Mes de la Mujer · Mesa con chicas 3x2",
+      ruleType: "bxgy",
+      scopeType: "category",
+      applicationMode: "manual_at_checkout",
+      targetId: "cat-cocktails",
+      validFrom: "2026-03-01",
+      validUntil: "2026-03-31",
+      config: { buyQty: 3, payQty: 2 },
+      priority: 5,
+      isStackable: false,
+      isActive: true,
+    };
+
+    expect(
+      isPromotionEligibleAt(womensMonth, {
+        isoDayOfWeek: 5,
+        currentTimeHHMM: "21:00",
+        currentDateYYYYMMDD: "2026-03-15",
+      }),
+    ).toBe(true);
+    expect(
+      isPromotionEligibleAt(womensMonth, {
+        isoDayOfWeek: 5,
+        currentTimeHHMM: "21:00",
+        currentDateYYYYMMDD: "2026-04-02",
+      }),
+    ).toBe(false);
+
+    const cocktailRes = evaluateSubAccountPromotion(womensMonth, [
+      { id: "c1", categoryId: "cat-cocktails", menuProductId: "m1", presentationId: "pm1", unitPrice: 22000, quantity: 2 },
+      { id: "c2", categoryId: "cat-cocktails", menuProductId: "m2", presentationId: "pm2", unitPrice: 20000, quantity: 1 },
+    ]);
+    // 3 cocktails total -> cheapest one (20.000) is free!
+    expect(cocktailRes.totalDiscount).toBe(20000);
   });
 });
 
