@@ -1,6 +1,5 @@
 import { useState } from "react";
 import {
-  CheckCircle2,
   Clock,
   ImagePlus,
   Layers,
@@ -17,8 +16,10 @@ import type {
   PresentationGroup,
   PromotionRule,
 } from "@liquistock/domain";
-import { apiFetch, resolveImageUrl } from "../../infrastructure/api/api-client.js";
+import { ApiError, apiFetch } from "../../infrastructure/api/api-client.js";
 import type { useLiquiStock } from "../../infrastructure/sync/useLiquiStock.js";
+import { useFeedback } from "../../shared/components/FeedbackProvider.js";
+import { ProductVisualAvatar } from "../../shared/components/ProductTypeIcon.js";
 import { formatCOP } from "../../shared/lib/format.js";
 import { haptics } from "../../shared/lib/haptics.js";
 import { NewComboModal } from "./NewComboModal.js";
@@ -59,8 +60,16 @@ const FLAG_LABELS: Array<{ key: keyof BranchFeatureFlags; label: string; desc: s
   },
 ];
 
-export function BarConfigView({ store, branchId }: { store: StoreType; branchId: string }) {
-  const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+export function BarConfigView({
+  store,
+  branchId,
+  onGoToPos,
+}: {
+  store: StoreType;
+  branchId: string;
+  onGoToPos?: () => void;
+}) {
+  const { toast, showAlertModal } = useFeedback();
   const [showComboModal, setShowComboModal] = useState(false);
   const [showPromoModal, setShowPromoModal] = useState(false);
   const [editingPromo, setEditingPromo] = useState<PromotionRule | null>(null);
@@ -94,10 +103,17 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
 
   const effectivePresProductId = newPresProductId || store.menuProducts[0]?.id || "";
   const effectivePresInvId = newPresInvId || store.inventoryItems[0]?.id || "";
+  const selectedPresInv = store.inventoryItems.find((i) => i.id === effectivePresInvId);
+  const selectedPresSupportsFoam = Boolean(
+    selectedPresInv && (selectedPresInv.isKeg || selectedPresInv.baseUnit === "ml"),
+  );
 
   const notify = (kind: "ok" | "err", text: string) => {
-    setNotice({ kind, text });
-    window.setTimeout(() => setNotice(null), 4000);
+    toast({
+      kind: kind === "ok" ? "success" : "error",
+      title: kind === "ok" ? "Cambio guardado" : "Atención",
+      description: text,
+    });
   };
 
   const runAction = async (label: string, fn: () => Promise<void>) => {
@@ -115,14 +131,81 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
     }
   };
 
-  const toggleFlag = (key: keyof BranchFeatureFlags) => {
+  const toggleFlag = async (key: keyof BranchFeatureFlags) => {
     const nextValue = !store.featureFlags[key];
-    void runAction(`Módulo actualizado (${nextValue ? "ACTIVO" : "OFF"})`, async () => {
+    setSaving(true);
+    try {
       await apiFetch(`/api/v1/branches/${branchId}/settings`, {
         method: "PATCH",
         body: JSON.stringify({ [key]: nextValue }),
       });
-    });
+      haptics.success();
+      await store.refresh();
+      notify("ok", `Módulo actualizado (${nextValue ? "ACTIVO" : "OFF"})`);
+    } catch (err) {
+      haptics.blocked();
+      if (err instanceof ApiError && err.code === "SPLIT_ACCOUNTS_OPEN") {
+        const affected = (err.details?.affectedTables ?? []) as Array<{
+          tableLabel: string;
+          openSubAccountsCount: number;
+          pendingTotal: number;
+          secondaryHavePayments: boolean;
+        }>;
+        const canAutoConsolidate = Boolean(err.details?.canAutoConsolidate);
+
+        showAlertModal({
+          tone: "warning",
+          title: "Hay mesas con cuentas divididas abiertas",
+          description: canAutoConsolidate
+            ? "Para cambiar a modo «Solo mesa» (una cuenta por mesa), primero debes cerrar o unificar las sub-cuentas abiertas."
+            : "Algunas sub-cuentas secundarias ya tienen abonos o fiado registrados. Debes finalizar su cobro en Mesas & POS antes de cambiar a modo solo mesa.",
+          bulletItems: affected.map(
+            (t) =>
+              `${t.tableLabel}: ${t.openSubAccountsCount} cuentas abiertas · Saldo ${formatCOP(t.pendingTotal)}${t.secondaryHavePayments ? " (con abonos)" : ""}`,
+          ),
+          actions: [
+            ...(canAutoConsolidate
+              ? [
+                  {
+                    label: "Unificar en Cuenta 1 y pasar a solo mesa",
+                    variant: "warning" as const,
+                    onClick: async () => {
+                      await apiFetch(
+                        `/api/v1/branches/${branchId}/settings/consolidate-and-disable-splits`,
+                        { method: "POST" },
+                      );
+                      haptics.success();
+                      await store.refresh();
+                      toast({
+                        kind: "success",
+                        title: "Modo solo mesa activado",
+                        description:
+                          "Se unificaron las cuentas divididas en la cuenta principal de cada mesa.",
+                      });
+                    },
+                  },
+                ]
+              : []),
+            ...(onGoToPos
+              ? [
+                  {
+                    label: "Ir a Mesas & POS",
+                    variant: "primary" as const,
+                    onClick: () => {
+                      onGoToPos();
+                    },
+                  },
+                ]
+              : []),
+            { label: "Cancelar", variant: "secondary" },
+          ],
+        });
+      } else {
+        notify("err", err instanceof Error ? err.message : "No se pudo guardar el cambio");
+      }
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleUploadImage = async (productId: string, file: File) => {
@@ -180,8 +263,8 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
                   inventoryItemId: effectivePresInvId,
                   displayUnit: newPresUnit,
                   displayQuantity: Math.max(0.001, Number(newPresQty) || 1),
-                  pourLossPercent: Number(newPresFoamPct) || 0,
-                  fixedLossBase: Number(newPresPurgeMl) || 0,
+                  pourLossPercent: selectedPresSupportsFoam ? Number(newPresFoamPct) || 0 : 0,
+                  fixedLossBase: selectedPresSupportsFoam ? Number(newPresPurgeMl) || 0 : 0,
                 },
               ]
             : [],
@@ -207,20 +290,6 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
 
   return (
     <div className="space-y-6">
-      {/* Banner de confirmación / error */}
-      {notice && (
-        <div
-          className={`flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold ${
-            notice.kind === "ok"
-              ? "border-success/40 bg-success/15 text-success"
-              : "border-destructive/40 bg-destructive/15 text-destructive"
-          }`}
-        >
-          <CheckCircle2 className="h-4 w-4 shrink-0" />
-          <span>{notice.text}</span>
-        </div>
-      )}
-
       {/* Acción destacada: Constructor de Combos */}
       <section className="solid-card flex flex-wrap items-center justify-between gap-4 rounded-2xl border-primary/30 p-5">
         <div className="flex items-center gap-3">
@@ -268,7 +337,7 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
                 key={key}
                 type="button"
                 disabled={saving}
-                onClick={() => toggleFlag(key)}
+                onClick={() => void toggleFlag(key)}
                 className={`press-response flex flex-col justify-between rounded-xl border p-3.5 text-left ${
                   enabled
                     ? "border-primary/40 bg-primary/10"
@@ -439,7 +508,6 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
         <div className="grid gap-3 md:grid-cols-2">
           {store.menuProducts.map((prod) => {
             const presList = store.presentations.filter((p) => p.menuProductId === prod.id);
-            const imgUrl = resolveImageUrl(prod.imageUrl);
             return (
               <div
                 key={prod.id}
@@ -447,17 +515,14 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
-                    {imgUrl ? (
-                      <img
-                        src={imgUrl}
-                        alt={prod.name}
-                        className="h-12 w-12 rounded-xl object-cover"
-                      />
-                    ) : (
-                      <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-secondary text-xs text-muted-foreground">
-                        Foto
-                      </div>
-                    )}
+                    <ProductVisualAvatar
+                      imageUrl={prod.imageUrl}
+                      name={prod.name}
+                      productKind={prod.productKind}
+                      allyId={prod.allyId}
+                      presentationGroup={presList[0]?.presentationGroup}
+                      size="sm"
+                    />
                     <div>
                       <p className="font-bold">{prod.name}</p>
                       <p className="text-[11px] text-muted-foreground">{prod.productKind}</p>
@@ -487,8 +552,11 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
                         <span className="font-semibold">{pr.name}</span>
                         {pr.recipes[0] && (
                           <span className="ml-2 text-[11px] text-muted-foreground">
-                            ({pr.recipes[0].displayQuantity} {pr.recipes[0].displayUnit} · espuma{" "}
-                            {pr.recipes[0].pourLossPercent}% + {pr.recipes[0].fixedLossBase}ml)
+                            ({pr.recipes[0].displayQuantity} {pr.recipes[0].displayUnit}
+                            {pr.recipes[0].pourLossPercent > 0 || pr.recipes[0].fixedLossBase > 0
+                              ? ` · espuma ${pr.recipes[0].pourLossPercent}%${pr.recipes[0].fixedLossBase > 0 ? ` + ${pr.recipes[0].fixedLossBase}ml` : ""}`
+                              : ""}
+                            )
                           </span>
                         )}
                       </div>
@@ -592,33 +660,39 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
                 <option value="ml">ml</option>
                 <option value="L">L</option>
                 <option value="oz">oz</option>
+                <option value="g">g</option>
+                <option value="kg">kg</option>
                 <option value="unit">und</option>
               </select>
             </div>
           </div>
 
           <div className="mt-2.5 flex flex-wrap items-center gap-3 text-xs">
-            <label className="flex items-center gap-1.5">
-              <span className="text-muted-foreground">% Espuma:</span>
-              <input
-                type="number"
-                min={0}
-                max={50}
-                value={newPresFoamPct}
-                onChange={(e) => setNewPresFoamPct(e.target.value)}
-                className="w-16 rounded-lg border border-white/15 bg-background px-2 py-1.5 tabular-nums"
-              />
-            </label>
-            <label className="flex items-center gap-1.5">
-              <span className="text-muted-foreground">Purga fija (ml):</span>
-              <input
-                type="number"
-                min={0}
-                value={newPresPurgeMl}
-                onChange={(e) => setNewPresPurgeMl(e.target.value)}
-                className="w-16 rounded-lg border border-white/15 bg-background px-2 py-1.5 tabular-nums"
-              />
-            </label>
+            {selectedPresSupportsFoam && (
+              <>
+                <label className="flex items-center gap-1.5">
+                  <span className="text-muted-foreground">% Espuma:</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={50}
+                    value={newPresFoamPct}
+                    onChange={(e) => setNewPresFoamPct(e.target.value)}
+                    className="w-16 rounded-lg border border-white/15 bg-background px-2 py-1.5 tabular-nums"
+                  />
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <span className="text-muted-foreground">Purga fija (ml):</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={newPresPurgeMl}
+                    onChange={(e) => setNewPresPurgeMl(e.target.value)}
+                    className="w-16 rounded-lg border border-white/15 bg-background px-2 py-1.5 tabular-nums"
+                  />
+                </label>
+              </>
+            )}
             <button
               type="button"
               disabled={saving || !effectivePresProductId}
@@ -666,6 +740,24 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
                     : rule.ruleType === "fixed_discount"
                       ? `-${formatCOP(rule.config.fixedAmount ?? 0)}/und`
                       : `Precio fijo ${formatCOP(rule.config.fixedUnitPrice ?? 0)}`;
+              const scopeTargetLabel =
+                rule.scopeType === "category"
+                  ? store.categories.find((c) => c.id === rule.targetId)?.name ?? "Categoría"
+                  : rule.scopeType === "product"
+                    ? store.menuProducts.find((p) => p.id === rule.targetId)?.name ?? "Producto"
+                    : rule.scopeType === "presentation"
+                      ? (() => {
+                          const pr = store.presentations.find((x) => x.id === rule.targetId);
+                          const prod = pr
+                            ? store.menuProducts.find((p) => p.id === pr.menuProductId)
+                            : null;
+                          return pr ? `${prod?.name ?? ""} · ${pr.name}`.trim() : "Presentación";
+                        })()
+                      : "Toda la carta";
+              const groupFilterLabel =
+                rule.config.presentationGroups && rule.config.presentationGroups.length > 0
+                  ? `Solo: ${rule.config.presentationGroups.join(", ")}`
+                  : null;
               return (
                 <div
                   key={rule.id}
@@ -683,9 +775,15 @@ export function BarConfigView({ store, branchId }: { store: StoreType; branchId:
                       >
                         {modeLabel}
                       </span>
+                      {groupFilterLabel && (
+                        <span className="rounded-full bg-success/15 px-2 py-0.5 text-[10px] font-bold text-success capitalize">
+                          {groupFilterLabel}
+                        </span>
+                      )}
                     </div>
                     <p className="mt-0.5 text-xs text-muted-foreground">
-                      {mechanic} · {rule.startTime ?? "00:00"}–{rule.endTime ?? "23:59"}
+                      {scopeTargetLabel} · {mechanic} · {rule.startTime ?? "00:00"}–
+                      {rule.endTime ?? "23:59"}
                       {rule.validFrom || rule.validUntil
                         ? ` · ${rule.validFrom ?? "…"} a ${rule.validUntil ?? "…"}`
                         : ""}

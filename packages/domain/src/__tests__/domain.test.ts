@@ -9,6 +9,7 @@ import {
   evaluateSubAccountPromotion,
   explodePresentationSale,
   generateUuidV7,
+  getQuickPromoOffersForPresentation,
   isPromotionEligibleAt,
   type Ally,
   type Customer,
@@ -471,6 +472,148 @@ describe("LiquiStock Domain Core", () => {
     ]);
     // 3 cocktails total -> cheapest one (20.000) is free!
     expect(cocktailRes.totalDiscount).toBe(20000);
+  });
+
+  it("supports 1-click quick promo offers (automatic + manual) and prevents double-discounting across multiple bundle lines", () => {
+    const rule2x1: PromotionRule = {
+      id: "promo-2x1",
+      branchId: "b1",
+      name: "Jueves 2x1 Cervezas",
+      ruleType: "bxgy",
+      scopeType: "category",
+      applicationMode: "automatic",
+      targetId: "cat-beer",
+      daysOfWeek: [4],
+      config: { buyQty: 2, payQty: 1 },
+      priority: 5,
+      isStackable: false,
+      isActive: true,
+    };
+
+    const manual3x2: PromotionRule = {
+      id: "promo-manual-3x2",
+      branchId: "b1",
+      name: "Mesa Cumpleaños 3x2",
+      ruleType: "bxgy",
+      scopeType: "category",
+      applicationMode: "manual_at_checkout",
+      targetId: "cat-beer",
+      config: { buyQty: 3, payQty: 2 },
+      priority: 10,
+      isStackable: false,
+      isActive: true,
+    };
+
+    // On Thursday (day 4), BOTH automatic 2x1 and manual 3x2 appear as quick offers
+    const thursdayOffers = getQuickPromoOffersForPresentation({
+      categoryId: "cat-beer",
+      menuProductId: "prod-ipa",
+      presentationId: "pres-pinta",
+      unitPrice: 14000,
+      rules: [rule2x1, manual3x2],
+      isoDayOfWeek: 4,
+      currentTimeHHMM: "20:00",
+    });
+    expect(thursdayOffers).toHaveLength(2);
+    expect(thursdayOffers[0]?.shortBadge).toBe("2x1");
+    expect(thursdayOffers[0]?.bundleQty).toBe(2);
+    expect(thursdayOffers[0]?.promoTotal).toBe(14000);
+    expect(thursdayOffers[1]?.shortBadge).toBe("3x2");
+    expect(thursdayOffers[1]?.bundleQty).toBe(3);
+    expect(thursdayOffers[1]?.promoTotal).toBe(28000);
+    expect(thursdayOffers[1]?.isManual).toBe(true);
+
+    // On Friday (day 5), Thursday 2x1 is hidden, only manual 3x2 remains
+    const fridayOffers = getQuickPromoOffersForPresentation({
+      categoryId: "cat-beer",
+      menuProductId: "prod-ipa",
+      presentationId: "pres-pinta",
+      unitPrice: 14000,
+      rules: [rule2x1, manual3x2],
+      isoDayOfWeek: 5,
+      currentTimeHHMM: "20:00",
+    });
+    expect(fridayOffers).toHaveLength(1);
+    expect(fridayOffers[0]?.rule.id).toBe("promo-manual-3x2");
+
+    // forcedRuleId applies a manual_at_checkout rule directly on 1-click add
+    const manualApplied = evaluateLinePromotion({
+      line: {
+        categoryId: "cat-beer",
+        menuProductId: "prod-ipa",
+        presentationId: "pres-pinta",
+        unitPrice: 14000,
+        quantity: 3,
+      },
+      rules: [rule2x1, manual3x2],
+      isoDayOfWeek: 5,
+      currentTimeHHMM: "20:00",
+      forcedRuleId: "promo-manual-3x2",
+    });
+    expect(manualApplied.promotionRuleId).toBe("promo-manual-3x2");
+    expect(manualApplied.discountAmount).toBe(14000);
+    expect(manualApplied.netTotal).toBe(28000);
+
+    // Two 1-click 2x1 bundle lines stay cleanly separated (14.000 discount EACH, never 28.000 on line 1)
+    const twoBundles = evaluateSubAccountPromotion(rule2x1, [
+      { id: "b1", categoryId: "cat-beer", menuProductId: "prod-ipa", presentationId: "pres-pinta", unitPrice: 14000, quantity: 2 },
+      { id: "b2", categoryId: "cat-beer", menuProductId: "prod-ipa", presentationId: "pres-pinta", unitPrice: 14000, quantity: 2 },
+    ]);
+    expect(twoBundles.totalDiscount).toBe(28000);
+    expect(twoBundles.allocations).toEqual([
+      { lineId: "b1", promotionRuleId: "promo-2x1", discountAmount: 14000, netTotal: 14000 },
+      { lineId: "b2", promotionRuleId: "promo-2x1", discountAmount: 14000, netTotal: 14000 },
+    ]);
+
+    // Category-scoped promo filtered to presentationGroups: ["pinta"] applies to ALL craft beer Pintas, never Jirafas!
+    const onlyPintasRule: PromotionRule = {
+      id: "promo-only-pintas",
+      branchId: "b1",
+      name: "2x1 Solo Pintas Artesanales",
+      ruleType: "bxgy",
+      scopeType: "category",
+      applicationMode: "automatic",
+      targetId: "cat-craft",
+      config: { buyQty: 2, payQty: 1, presentationGroups: ["pinta"] },
+      priority: 1,
+      isStackable: false,
+      isActive: true,
+    };
+
+    const pintaOffers = getQuickPromoOffersForPresentation({
+      categoryId: "cat-craft",
+      menuProductId: "prod-ipa",
+      presentationId: "pres-ipa-pinta",
+      presentationGroup: "pinta",
+      unitPrice: 14000,
+      rules: [onlyPintasRule],
+      isoDayOfWeek: 4,
+      currentTimeHHMM: "20:00",
+    });
+    expect(pintaOffers).toHaveLength(1);
+    expect(pintaOffers[0]?.promoTotal).toBe(14000);
+
+    const jirafaOffers = getQuickPromoOffersForPresentation({
+      categoryId: "cat-craft",
+      menuProductId: "prod-ipa",
+      presentationId: "pres-ipa-jirafa",
+      presentationGroup: "jirafa",
+      unitPrice: 65000,
+      rules: [onlyPintasRule],
+      isoDayOfWeek: 4,
+      currentTimeHHMM: "20:00",
+    });
+    expect(jirafaOffers).toHaveLength(0);
+
+    // Mixing 1 IPA Pinta + 1 Stout Pinta triggers 2x1 across the category, while a Jirafa in the same sub-account is untouched
+    const mixedPintas = evaluateSubAccountPromotion(onlyPintasRule, [
+      { id: "m1", categoryId: "cat-craft", menuProductId: "prod-ipa", presentationId: "p1", presentationGroup: "pinta", unitPrice: 15000, quantity: 1 },
+      { id: "m2", categoryId: "cat-craft", menuProductId: "prod-stout", presentationId: "p2", presentationGroup: "pinta", unitPrice: 14000, quantity: 1 },
+      { id: "m3", categoryId: "cat-craft", menuProductId: "prod-ipa", presentationId: "p3", presentationGroup: "jirafa", unitPrice: 65000, quantity: 2 },
+    ]);
+    expect(mixedPintas.totalDiscount).toBe(14000);
+    expect(mixedPintas.allocations).toHaveLength(1);
+    expect(mixedPintas.allocations[0]?.lineId).toBe("m2");
   });
 });
 

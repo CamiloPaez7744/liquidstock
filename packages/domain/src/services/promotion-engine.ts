@@ -1,4 +1,4 @@
-import type { PromotionRule } from "../entities/types.js";
+import type { PresentationGroup, PromotionRule } from "../entities/types.js";
 import { Money } from "../value-objects/money.js";
 import { isWithinTimeWindow } from "./availability-evaluator.js";
 
@@ -7,6 +7,7 @@ export interface PricedLineInput {
   categoryId: string;
   menuProductId: string;
   presentationId: string;
+  presentationGroup?: PresentationGroup | null;
   unitPrice: number;
   quantity: number;
 }
@@ -39,6 +40,34 @@ export interface SubAccountPromotionPreview {
   allocations: SubAccountPromotionAllocation[];
 }
 
+export interface QuickPromoOffer {
+  rule: PromotionRule;
+  bundleQty: number;
+  regularTotal: number;
+  discountAmount: number;
+  promoTotal: number;
+  shortBadge: string;
+  isManual: boolean;
+}
+
+export function formatPromotionShortBadge(rule: PromotionRule): string {
+  switch (rule.ruleType) {
+    case "bxgy": {
+      const buyQty = rule.config.buyQty ?? 2;
+      const payQty = rule.config.payQty ?? 1;
+      return `${buyQty}x${payQty}`;
+    }
+    case "percentage_discount":
+      return `-${Math.round(rule.config.percent ?? 0)}%`;
+    case "fixed_discount":
+      return `-$${Math.round(rule.config.fixedAmount ?? 0).toLocaleString("es-CO")}`;
+    case "fixed_price":
+      return "Precio promo";
+    default:
+      return "Promo";
+  }
+}
+
 export function isWithinDateRange(
   currentDateYYYYMMDD?: string,
   validFrom?: string | null,
@@ -63,18 +92,34 @@ export function isPromotionEligibleAt(
 }
 
 function ruleMatchesScope(rule: PromotionRule, line: PricedLineInput): boolean {
+  let scopeOk = false;
   switch (rule.scopeType) {
     case "category":
-      return rule.targetId === line.categoryId;
+      scopeOk = rule.targetId === line.categoryId;
+      break;
     case "product":
-      return rule.targetId === line.menuProductId;
+      scopeOk = rule.targetId === line.menuProductId;
+      break;
     case "presentation":
-      return rule.targetId === line.presentationId;
+      scopeOk = rule.targetId === line.presentationId;
+      break;
     case "order":
-      return true;
+      scopeOk = true;
+      break;
     default:
-      return false;
+      scopeOk = false;
   }
+
+  if (!scopeOk) return false;
+
+  // Optional presentation-group filter (e.g. "all Pintas" or "only Jirafas" within Craft Beers category)
+  const allowedGroups = rule.config?.presentationGroups;
+  if (rule.scopeType !== "presentation" && Array.isArray(allowedGroups) && allowedGroups.length > 0) {
+    if (!line.presentationGroup) return false;
+    return allowedGroups.includes(line.presentationGroup);
+  }
+
+  return true;
 }
 
 function calculateRuleDiscountCents(rule: PromotionRule, line: PricedLineInput): number {
@@ -113,8 +158,8 @@ function calculateRuleDiscountCents(rule: PromotionRule, line: PricedLineInput):
 }
 
 /**
- * Evaluates automatic single-line promotions (e.g. Happy Hour -15% on Pintas).
- * Skips `manual_at_checkout` rules (like Women's Month 3x2 for tables with women).
+ * Evaluates single-line promotions (e.g. Happy Hour -15% on Pintas, or 1-click 2x1 promo bundles).
+ * Skips `manual_at_checkout` rules UNLESS `forcedRuleId` explicitly selects that eligible rule.
  */
 export function evaluateLinePromotion(params: {
   line: PricedLineInput;
@@ -122,13 +167,33 @@ export function evaluateLinePromotion(params: {
   isoDayOfWeek: number;
   currentTimeHHMM: string;
   currentDateYYYYMMDD?: string;
+  forcedRuleId?: string | null;
 }): AppliedPromotionResult {
-  const { line, rules, isoDayOfWeek, currentTimeHHMM, currentDateYYYYMMDD } = params;
+  const { line, rules, isoDayOfWeek, currentTimeHHMM, currentDateYYYYMMDD, forcedRuleId } = params;
   const gross = Money.fromMajor(line.unitPrice).multiply(line.quantity);
+  const clock: PromotionClockContext = { isoDayOfWeek, currentTimeHHMM, currentDateYYYYMMDD };
+
+  if (forcedRuleId) {
+    const forced = rules.find((r) => r.id === forcedRuleId);
+    if (forced && isPromotionEligibleAt(forced, clock) && ruleMatchesScope(forced, line)) {
+      const discountCents = calculateRuleDiscountCents(forced, line);
+      if (discountCents > 0) {
+        const discount = Money.fromCents(Math.min(gross.toCents(), discountCents));
+        const net = gross.subtract(discount).maxZero();
+        return {
+          promotionRuleId: forced.id,
+          promotionName: forced.name,
+          grossTotal: gross.toMajor(),
+          discountAmount: discount.toMajor(),
+          netTotal: net.toMajor(),
+        };
+      }
+    }
+  }
 
   const eligible = rules
     .filter((r) => (r.applicationMode ?? "automatic") === "automatic")
-    .filter((r) => isPromotionEligibleAt(r, { isoDayOfWeek, currentTimeHHMM, currentDateYYYYMMDD }))
+    .filter((r) => isPromotionEligibleAt(r, clock))
     .filter((r) => ruleMatchesScope(r, line))
     .sort((a, b) => a.priority - b.priority);
 
@@ -154,6 +219,75 @@ export function evaluateLinePromotion(params: {
     discountAmount: discount.toMajor(),
     netTotal: net.toMajor(),
   };
+}
+
+/**
+ * Returns all active promotions currently eligible for a specific product presentation,
+ * including both automatic and manual rules, along with their 1-click bundle quantity and net price.
+ */
+export function getQuickPromoOffersForPresentation(params: {
+  categoryId: string;
+  menuProductId: string;
+  presentationId: string;
+  presentationGroup?: PresentationGroup | null;
+  unitPrice: number;
+  rules: readonly PromotionRule[];
+  isoDayOfWeek: number;
+  currentTimeHHMM: string;
+  currentDateYYYYMMDD?: string;
+}): QuickPromoOffer[] {
+  const {
+    categoryId,
+    menuProductId,
+    presentationId,
+    presentationGroup,
+    unitPrice,
+    rules,
+    isoDayOfWeek,
+    currentTimeHHMM,
+    currentDateYYYYMMDD,
+  } = params;
+  const clock: PromotionClockContext = { isoDayOfWeek, currentTimeHHMM, currentDateYYYYMMDD };
+
+  const offers: QuickPromoOffer[] = [];
+  const sorted = [...rules].sort((a, b) => a.priority - b.priority);
+
+  for (const rule of sorted) {
+    if (!isPromotionEligibleAt(rule, clock)) continue;
+
+    const bundleQty =
+      rule.ruleType === "bxgy"
+        ? Math.max(rule.config.buyQty ?? 2, rule.config.minQuantity ?? 1)
+        : Math.max(1, rule.config.minQuantity ?? 1);
+
+    const line: PricedLineInput = {
+      categoryId,
+      menuProductId,
+      presentationId,
+      presentationGroup: presentationGroup ?? null,
+      unitPrice,
+      quantity: bundleQty,
+    };
+
+    if (!ruleMatchesScope(rule, line)) continue;
+
+    const grossCents = Money.fromMajor(unitPrice).toCents() * bundleQty;
+    const rawDiscountCents = calculateRuleDiscountCents(rule, line);
+    const clampedDiscountCents = Math.min(grossCents, rawDiscountCents);
+    if (clampedDiscountCents <= 0) continue;
+
+    offers.push({
+      rule,
+      bundleQty,
+      regularTotal: Money.fromCents(grossCents).toMajor(),
+      discountAmount: Money.fromCents(clampedDiscountCents).toMajor(),
+      promoTotal: Money.fromCents(grossCents - clampedDiscountCents).toMajor(),
+      shortBadge: formatPromotionShortBadge(rule),
+      isManual: (rule.applicationMode ?? "automatic") === "manual_at_checkout",
+    });
+  }
+
+  return offers;
 }
 
 /**
@@ -183,24 +317,36 @@ export function evaluateSubAccountPromotion(
     if (buyQty <= 1 || payQty >= buyQty || totalQty < buyQty) {
       return { ruleId: rule.id, ruleName: rule.name, totalDiscount: 0, allocations: [] };
     }
-    const freeUnitsTotal = Math.floor(totalQty / buyQty) * (buyQty - payQty);
 
-    // Bar industry standard: free units apply to the lowest-priced eligible units first
-    const expandedUnits: Array<{ lineId: string; unitCents: number }> = [];
+    // 1. Allocate complete bundles directly to each line first (keeps 1-click promo bundles cleanly attributed)
+    const leftoverUnits: Array<{ lineId: string; unitCents: number }> = [];
     for (const line of matching) {
       const unitCents = Money.fromMajor(line.unitPrice).toCents();
-      for (let i = 0; i < line.quantity; i += 1) {
-        expandedUnits.push({ lineId: line.id, unitCents });
+      const lineCompleteBundles = Math.floor(line.quantity / buyQty);
+      if (lineCompleteBundles > 0) {
+        const lineFreeUnits = lineCompleteBundles * (buyQty - payQty);
+        discountCentsByLine.set(
+          line.id,
+          (discountCentsByLine.get(line.id) ?? 0) + lineFreeUnits * unitCents,
+        );
+      }
+      const remainder = line.quantity % buyQty;
+      for (let i = 0; i < remainder; i += 1) {
+        leftoverUnits.push({ lineId: line.id, unitCents });
       }
     }
-    expandedUnits.sort((a, b) => a.unitCents - b.unitCents);
 
-    for (let i = 0; i < Math.min(freeUnitsTotal, expandedUnits.length); i += 1) {
-      const unit = expandedUnits[i]!;
-      discountCentsByLine.set(
-        unit.lineId,
-        (discountCentsByLine.get(unit.lineId) ?? 0) + unit.unitCents,
-      );
+    // 2. Allocate remaining cross-line bundles from leftover units (cheapest eligible unit free first)
+    const crossLineFreeUnits = Math.floor(leftoverUnits.length / buyQty) * (buyQty - payQty);
+    if (crossLineFreeUnits > 0) {
+      leftoverUnits.sort((a, b) => a.unitCents - b.unitCents);
+      for (let i = 0; i < Math.min(crossLineFreeUnits, leftoverUnits.length); i += 1) {
+        const unit = leftoverUnits[i]!;
+        discountCentsByLine.set(
+          unit.lineId,
+          (discountCentsByLine.get(unit.lineId) ?? 0) + unit.unitCents,
+        );
+      }
     }
   } else {
     for (const line of matching) {

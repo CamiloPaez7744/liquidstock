@@ -306,8 +306,121 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
     [branchId, activeUserId],
   );
 
+  const deleteSubAccount = useCallback(
+    async (
+      subAccountId: string,
+      options?: {
+        mode?: "empty_only" | "move_items" | "void_items";
+        targetSubAccountId?: string | null;
+        reason?: string;
+      },
+    ) => {
+      const sub = await localDb.subAccounts.get(subAccountId);
+      if (!sub || sub.status !== "open") return;
+      if (sub.paidAmount > 0 || sub.creditAmount > 0) {
+        throw new Error(
+          "Esta cuenta ya tiene abonos o fiado registrados. Debes finalizar el cobro antes de cerrarla.",
+        );
+      }
+
+      const mode = options?.mode ?? "empty_only";
+      const targetSubAccountId = options?.targetSubAccountId ?? null;
+      const reason = options?.reason ?? "Cuenta eliminada en POS";
+
+      await localDb.transaction(
+        "rw",
+        [
+          localDb.subAccounts,
+          localDb.tableSessions,
+          localDb.orderItems,
+          localDb.inventoryItems,
+          localDb.presentations,
+          localDb.syncOutbox,
+        ],
+        async () => {
+          const activeItems = await localDb.orderItems
+            .where("subAccountId")
+            .equals(subAccountId)
+            .filter((i) => i.status === "active")
+            .toArray();
+
+          if (activeItems.length > 0) {
+            if (mode === "move_items" && targetSubAccountId && targetSubAccountId !== subAccountId) {
+              for (const item of activeItems) {
+                await localDb.orderItems.update(item.id, { subAccountId: targetSubAccountId });
+              }
+              await recalcLocalSubAccount(targetSubAccountId);
+            } else if (mode === "void_items") {
+              for (const item of activeItems) {
+                await localDb.orderItems.update(item.id, { status: "voided" });
+                const pres = await localDb.presentations.get(item.presentationId);
+                if (pres) {
+                  const explosion = explodePresentationSale({
+                    productKind: item.productKindSnap,
+                    presentation: pres,
+                    quantity: item.quantity,
+                    applyFoamLossFormula: featureFlags.enableFoamLossFormula,
+                  });
+                  for (const d of explosion.deductions) {
+                    const inv = await localDb.inventoryItems.get(d.inventoryItemId);
+                    if (inv) {
+                      await localDb.inventoryItems.update(inv.id, {
+                        currentStockBase:
+                          Math.round((inv.currentStockBase + d.totalDeductionBase) * 1000) / 1000,
+                      });
+                    }
+                  }
+                }
+              }
+            } else {
+              throw new Error("Esta cuenta aún tiene productos activos.");
+            }
+          }
+
+          await localDb.subAccounts.update(subAccountId, {
+            status: "voided",
+            subtotalAmount: 0,
+            discountAmount: 0,
+            totalAmount: 0,
+            updatedAt: new Date().toISOString(),
+          });
+
+          const openSiblings = await localDb.subAccounts
+            .where("tableSessionId")
+            .equals(sub.tableSessionId)
+            .filter((s) => s.status === "open")
+            .count();
+          if (openSiblings === 0) {
+            await localDb.tableSessions.update(sub.tableSessionId, { status: "closed" });
+          }
+
+          await enqueueOfflineCommand({
+            branchId,
+            userId: activeUserId,
+            commandType: "DELETE_SUB_ACCOUNT",
+            payload: {
+              subAccountId,
+              mode,
+              targetSubAccountId,
+              reason,
+            },
+          });
+        },
+      );
+
+      void syncEngine.flushOutbox(branchId);
+    },
+    [branchId, activeUserId, featureFlags.enableFoamLossFormula],
+  );
+
   const addOrderItem = useCallback(
-    async (subAccountId: string, product: MenuProduct, presentation: ProductPresentation, quantity = 1) => {
+    async (
+      subAccountId: string,
+      product: MenuProduct,
+      presentation: ProductPresentation,
+      quantity = 1,
+      forcedPromotionRuleId?: string | null,
+    ) => {
       const orderItemId = generateUuidV7();
       const { isoDay, hhmm, yyyymmdd } = getCurrentIsoDayAndTime();
 
@@ -317,6 +430,7 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
               categoryId: product.categoryId,
               menuProductId: product.id,
               presentationId: presentation.id,
+              presentationGroup: presentation.presentationGroup,
               unitPrice: presentation.salePrice,
               quantity,
             },
@@ -324,6 +438,7 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
             isoDayOfWeek: isoDay,
             currentTimeHHMM: hhmm,
             currentDateYYYYMMDD: yyyymmdd,
+            forcedRuleId: forcedPromotionRuleId ?? null,
           })
         : {
             promotionRuleId: null,
@@ -337,6 +452,12 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
         quantity,
         applyFoamLossFormula: featureFlags.enableFoamLossFormula,
       });
+
+      const manualRuleIds = new Set(
+        promotionRules
+          .filter((r) => (r.applicationMode ?? "automatic") === "manual_at_checkout")
+          .map((r) => r.id),
+      );
 
       await localDb.transaction(
         "rw",
@@ -379,13 +500,19 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
               const activeItems = await localDb.orderItems
                 .where("subAccountId")
                 .equals(subAccountId)
-                .filter((i) => i.status === "active" && !i.adjustmentReason)
+                .filter(
+                  (i) =>
+                    i.status === "active" &&
+                    !i.adjustmentReason &&
+                    !(i.promotionRuleId && manualRuleIds.has(i.promotionRuleId)),
+                )
                 .toArray();
               const lineInputs = activeItems.map((i) => ({
                 id: i.id,
                 categoryId: i.categoryId,
                 menuProductId: i.menuProductId,
                 presentationId: i.presentationId,
+                presentationGroup: i.presentationGroupSnap,
                 unitPrice: i.unitPriceSnap,
                 quantity: i.quantity,
               }));
@@ -426,6 +553,7 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
               subAccountId,
               presentationId: presentation.id,
               quantity,
+              ...(forcedPromotionRuleId ? { forcedPromotionRuleId } : {}),
             },
           });
         },
@@ -565,6 +693,7 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
               categoryId: i.categoryId,
               menuProductId: i.menuProductId,
               presentationId: i.presentationId,
+              presentationGroup: i.presentationGroupSnap,
               unitPrice: i.unitPriceSnap,
               quantity: i.quantity,
             })),
@@ -713,6 +842,7 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
     refresh: hydrateFromServer,
     openTableSession,
     createSubAccount,
+    deleteSubAccount,
     addOrderItem,
     voidOrderItem,
     moveOrderItem,

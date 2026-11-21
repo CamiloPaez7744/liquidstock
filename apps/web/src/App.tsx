@@ -32,6 +32,7 @@ import { BarConfigView } from "./features/settings/BarConfigView.js";
 import { SuperAdminDashboard } from "./features/superadmin/SuperAdminDashboard.js";
 import { TablesPosView } from "./features/tables-pos/TablesPosView.js";
 import { UsersBranchesView } from "./features/users/UsersBranchesView.js";
+import { FeedbackProvider } from "./shared/components/FeedbackProvider.js";
 import { haptics } from "./shared/lib/haptics.js";
 
 type PosSection = "pos" | "inventory" | "cash" | "kpis" | "settings" | "users";
@@ -44,7 +45,7 @@ const NAV_ITEMS: Array<{
   roles: Array<"admin" | "cashier" | "waiter">;
 }> = [
   { id: "pos", label: "Mesas & POS", shortLabel: "POS", icon: UtensilsCrossed, roles: ["admin", "cashier", "waiter"] },
-  { id: "inventory", label: "Barriles & Stock", shortLabel: "Stock", icon: Beer, roles: ["admin", "cashier"] },
+  { id: "inventory", label: "Stock", shortLabel: "Stock", icon: Beer, roles: ["admin", "cashier", "waiter"] },
   { id: "cash", label: "Caja & Cierre", shortLabel: "Caja", icon: Receipt, roles: ["admin", "cashier"] },
   { id: "kpis", label: "KPIs", shortLabel: "KPIs", icon: BarChart3, roles: ["admin"] },
   { id: "settings", label: "Config Bar", shortLabel: "Config", icon: Settings2, roles: ["admin"] },
@@ -149,15 +150,15 @@ function AuthenticatedPosShell({
               {barTitle}
             </h1>
             {session.user.memberships.length > 1 ? (
-              <label className="flex items-center gap-1 text-[11px] text-primary">
+              <label className="mt-0.5 inline-flex items-center gap-1 rounded-lg border border-primary/25 bg-primary/10 pl-2 pr-1 text-[11px] text-primary">
                 <Building2 className="h-3 w-3 shrink-0" />
                 <select
                   value={activeBranchId}
                   onChange={(e) => handleSwitchBranch(e.target.value)}
-                  className="max-w-40 truncate bg-transparent text-[11px] font-semibold text-primary focus:outline-none sm:max-w-none"
+                  className="max-w-40 truncate border-0 bg-transparent py-0.5 text-[11px] font-semibold text-primary focus:shadow-none sm:max-w-none"
                 >
                   {session.user.memberships.map((m) => (
-                    <option key={m.branchId} value={m.branchId} className="bg-card text-foreground">
+                    <option key={m.branchId} value={m.branchId}>
                       {m.organizationName !== barTitle
                         ? `${m.organizationName} · ${m.branchName}`
                         : m.branchName}
@@ -234,16 +235,32 @@ function AuthenticatedPosShell({
             <TablesPosView
               store={store}
               isAdmin={isAdmin}
+              barBranding={
+                activeOrg
+                  ? {
+                      name: activeOrg.name,
+                      legalName: activeOrg.legalName,
+                      taxId: activeOrg.taxId,
+                      logoUrl: activeOrg.logoUrl,
+                      instagram: activeOrg.socialLinks?.instagram,
+                      contactPhone: activeOrg.contactPhone,
+                    }
+                  : undefined
+              }
               onGoToInventory={() => setSection("inventory")}
             />
           ) : currentSection === "inventory" ? (
-            <InventoryView store={store} branchId={activeBranchId} />
+            <InventoryView store={store} branchId={activeBranchId} isAdmin={isAdmin} />
           ) : currentSection === "cash" ? (
             <CashShiftView store={store} branchId={activeBranchId} />
           ) : currentSection === "kpis" ? (
             <KpisView store={store} branchId={activeBranchId} />
           ) : currentSection === "settings" ? (
-            <BarConfigView store={store} branchId={activeBranchId} />
+            <BarConfigView
+              store={store}
+              branchId={activeBranchId}
+              onGoToPos={() => setSection("pos")}
+            />
           ) : (
             <UsersBranchesView
               store={store}
@@ -313,19 +330,19 @@ export function App() {
     setSession(null);
   };
 
-  if (!session) {
-    return <AuthScreen onAuthenticated={setSession} />;
-  }
-
-  if (session.user.isSuperAdmin) {
-    return <SuperAdminDashboard user={session.user} onLogout={() => void handleLogout()} />;
-  }
-
   return (
-    <AuthenticatedPosShell
-      session={session}
-      onUpdateSession={setSession}
-      onLogout={() => void handleLogout()}
-    />
+    <FeedbackProvider>
+      {!session ? (
+        <AuthScreen onAuthenticated={setSession} />
+      ) : session.user.isSuperAdmin ? (
+        <SuperAdminDashboard user={session.user} onLogout={() => void handleLogout()} />
+      ) : (
+        <AuthenticatedPosShell
+          session={session}
+          onUpdateSession={setSession}
+          onLogout={() => void handleLogout()}
+        />
+      )}
+    </FeedbackProvider>
   );
 }

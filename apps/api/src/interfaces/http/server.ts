@@ -21,6 +21,7 @@ import { registerAdminCatalogRoutes } from "./routes/admin-catalog.routes.js";
 import { registerAuthAndUsersRoutes } from "./routes/auth-users.routes.js";
 import { registerBootstrapRoutes } from "./routes/bootstrap.routes.js";
 import { registerInventoryRoutes } from "./routes/inventory.routes.js";
+import { registerPhase3OperationsRoutes } from "./routes/phase3-operations.routes.js";
 import { registerShiftsAndKpisRoutes } from "./routes/shifts-kpis.routes.js";
 
 const syncBatchSchema = z.object({
@@ -35,6 +36,7 @@ const syncBatchSchema = z.object({
       commandType: z.enum([
         "OPEN_TABLE_SESSION",
         "CREATE_SUB_ACCOUNT",
+        "DELETE_SUB_ACCOUNT",
         "ADD_ORDER_ITEM",
         "VOID_ORDER_ITEM",
         "MOVE_ORDER_ITEM",
@@ -52,6 +54,13 @@ const syncBatchSchema = z.object({
 
 export async function buildServer() {
   const app = Fastify({ logger: true });
+
+  // Safe idempotent schema evolution for live embedded PGlite / PostgreSQL instances
+  try {
+    await db.query(`ALTER TABLE menu_products ADD COLUMN IF NOT EXISTS edition_tag TEXT`);
+  } catch {
+    // Table may not exist yet before migrations run in test harness
+  }
 
   const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "./uploads");
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -156,6 +165,7 @@ export async function buildServer() {
   await registerAdminCatalogRoutes(app, uploadDir);
   await registerInventoryRoutes(app);
   await registerShiftsAndKpisRoutes(app);
+  await registerPhase3OperationsRoutes(app);
 
   return app;
 }

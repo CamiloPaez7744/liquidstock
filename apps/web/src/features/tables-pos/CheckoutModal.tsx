@@ -100,6 +100,7 @@ export function CheckoutModal({
         categoryId: i.categoryId,
         menuProductId: i.menuProductId,
         presentationId: i.presentationId,
+        presentationGroup: i.presentationGroupSnap,
         unitPrice: i.unitPriceSnap,
         quantity: i.quantity,
       }));

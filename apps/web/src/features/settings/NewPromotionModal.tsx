@@ -1,8 +1,9 @@
-import { useState } from "react";
-import { Calendar, Gift, Percent, Sparkles, Users, X } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Calendar, Gift, Percent, Sparkles, Tag, Users, X, Zap } from "lucide-react";
 import type {
   MenuCategory,
   MenuProduct,
+  PresentationGroup,
   ProductPresentation,
   PromotionApplicationMode,
   PromotionRule,
@@ -11,6 +12,31 @@ import type {
 } from "@liquistock/domain";
 import { apiFetch } from "../../infrastructure/api/api-client.js";
 import { haptics } from "../../shared/lib/haptics.js";
+
+const PRESENTATION_GROUP_LABELS: Record<PresentationGroup, string> = {
+  vaso: "Vaso / Media",
+  pinta: "Pinta",
+  jarra: "Jarra",
+  jirafa: "Jirafa",
+  shot: "Shot",
+  trago: "Trago",
+  coctel: "Cóctel",
+  botella: "Botella",
+  lata: "Lata",
+  combo: "Combo",
+  comida: "Comida",
+  otro: "Otro",
+};
+
+const FALLBACK_GROUPS: PresentationGroup[] = [
+  "vaso",
+  "pinta",
+  "jarra",
+  "jirafa",
+  "botella",
+  "shot",
+  "coctel",
+];
 
 const DAYS = [
   { id: 1, label: "L" },
@@ -53,6 +79,49 @@ export function NewPromotionModal({
     editingRule?.scopeType ?? "category",
   );
   const [targetId, setTargetId] = useState(editingRule?.targetId ?? categories[0]?.id ?? "");
+  const [presentationGroups, setPresentationGroups] = useState<PresentationGroup[]>(
+    editingRule?.config.presentationGroups ?? [],
+  );
+
+  const productNameById = useMemo(
+    () => new Map(products.map((p) => [p.id, p.name])),
+    [products],
+  );
+
+  const availablePresentationGroups = useMemo(() => {
+    const groupSet = new Set<PresentationGroup>();
+    if (scopeType === "category" && targetId) {
+      const catProductIds = new Set(
+        products.filter((p) => p.categoryId === targetId).map((p) => p.id),
+      );
+      for (const pr of presentations) {
+        if (catProductIds.has(pr.menuProductId)) {
+          groupSet.add(pr.presentationGroup);
+        }
+      }
+    } else if (scopeType === "product" && targetId) {
+      for (const pr of presentations) {
+        if (pr.menuProductId === targetId) {
+          groupSet.add(pr.presentationGroup);
+        }
+      }
+    } else if (scopeType === "order") {
+      for (const pr of presentations) {
+        groupSet.add(pr.presentationGroup);
+      }
+    }
+    for (const g of presentationGroups) {
+      groupSet.add(g);
+    }
+    return groupSet.size > 0 ? Array.from(groupSet) : FALLBACK_GROUPS;
+  }, [scopeType, targetId, products, presentations, presentationGroups]);
+
+  const togglePresentationGroup = (group: PresentationGroup) => {
+    haptics.tap();
+    setPresentationGroups((prev) =>
+      prev.includes(group) ? prev.filter((g) => g !== group) : [...prev, group],
+    );
+  };
 
   // Cantidad / Porcentaje / Precio fijo
   const [buyQty, setBuyQty] = useState(String(editingRule?.config.buyQty ?? 3));
@@ -80,6 +149,7 @@ export function NewPromotionModal({
 
   const applyPreset = (preset: PromoPreset) => {
     haptics.tap();
+    setPresentationGroups([]);
     if (preset === "bxgy_3x2_women") {
       setName("Mes de la Mujer · Mesa con Chicas 3x2");
       setRuleType("bxgy");
@@ -156,7 +226,7 @@ export function NewPromotionModal({
       return;
     }
 
-    const config: Record<string, number> = {
+    const config: Record<string, unknown> = {
       minQuantity: Math.max(1, Number(minQuantity) || 1),
     };
     if (ruleType === "bxgy") {
@@ -168,6 +238,9 @@ export function NewPromotionModal({
       config.fixedAmount = Number(fixedAmount) || 0;
     } else if (ruleType === "fixed_price") {
       config.fixedUnitPrice = Number(fixedUnitPrice) || 0;
+    }
+    if (scopeType !== "presentation" && presentationGroups.length > 0) {
+      config.presentationGroups = presentationGroups;
     }
 
     setSaving(true);
@@ -296,7 +369,10 @@ export function NewPromotionModal({
                     : "border-white/10 bg-background/50 text-muted-foreground"
                 }`}
               >
-                <p className="font-bold">⚡ Automática</p>
+                <p className="flex items-center gap-1.5 font-bold">
+                  <Zap className="h-3.5 w-3.5 text-primary" />
+                  Automática
+                </p>
                 <p className="mt-0.5 text-[11px] opacity-80">
                   Se aplica sola al cumplir día, hora o cantidad (ej. Happy Hour, 10+1 gratis).
                 </p>
@@ -310,7 +386,10 @@ export function NewPromotionModal({
                     : "border-white/10 bg-background/50 text-muted-foreground"
                 }`}
               >
-                <p className="font-bold">🏷️ Manual al Cobrar (Condicional)</p>
+                <p className="flex items-center gap-1.5 font-bold">
+                  <Tag className="h-3.5 w-3.5 text-accent" />
+                  Manual al Cobrar (Condicional)
+                </p>
                 <p className="mt-0.5 text-[11px] opacity-80">
                   Aparece como botón al cobrar para mesas que cumplan (ej. mesa con chicas en marzo).
                 </p>
@@ -342,6 +421,7 @@ export function NewPromotionModal({
                   onChange={(e) => {
                     const next = e.target.value as PromotionScopeType;
                     setScopeType(next);
+                    setPresentationGroups([]);
                     if (next === "category") setTargetId(categories[0]?.id ?? "");
                     else if (next === "product") setTargetId(products[0]?.id ?? "");
                     else if (next === "presentation") setTargetId(presentations[0]?.id ?? "");
@@ -349,10 +429,10 @@ export function NewPromotionModal({
                   }}
                   className="w-full rounded-xl border border-white/15 bg-background px-3 py-2.5 text-sm"
                 >
-                  <option value="category">Una Categoría</option>
+                  <option value="category">Una Categoría (ej. Cervezas Artesanales)</option>
                   <option value="product">Un Producto específico</option>
-                  <option value="presentation">Una Presentación (ej. Pinta 500ml)</option>
-                  <option value="order">Toda la cuenta</option>
+                  <option value="presentation">Una Presentación puntual de 1 producto</option>
+                  <option value="order">Toda la carta</option>
                 </select>
               </div>
             </div>
@@ -362,7 +442,10 @@ export function NewPromotionModal({
                 <label className="mb-1 block text-xs text-muted-foreground">Objetivo</label>
                 <select
                   value={targetId}
-                  onChange={(e) => setTargetId(e.target.value)}
+                  onChange={(e) => {
+                    setTargetId(e.target.value);
+                    setPresentationGroups([]);
+                  }}
                   className="w-full rounded-xl border border-white/15 bg-background px-3 py-2 text-sm"
                 >
                   {scopeType === "category" &&
@@ -380,10 +463,63 @@ export function NewPromotionModal({
                   {scopeType === "presentation" &&
                     presentations.map((pr) => (
                       <option key={pr.id} value={pr.id}>
-                        {pr.name}
+                        {productNameById.get(pr.menuProductId) ?? "Producto"} — {pr.name}
                       </option>
                     ))}
                 </select>
+              </div>
+            )}
+
+            {scopeType !== "presentation" && (
+              <div className="rounded-xl border border-white/10 bg-background/50 p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <label className="text-xs font-semibold text-foreground">
+                    Filtrar por presentación (opcional)
+                  </label>
+                  <span className="text-[11px] text-muted-foreground">
+                    {presentationGroups.length === 0
+                      ? "Todas las presentaciones"
+                      : `Solo: ${presentationGroups.map((g) => PRESENTATION_GROUP_LABELS[g]).join(", ")}`}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      haptics.tap();
+                      setPresentationGroups([]);
+                    }}
+                    className={`press-response rounded-lg border px-2.5 py-1.5 text-xs font-bold transition ${
+                      presentationGroups.length === 0
+                        ? "border-primary bg-primary/20 text-primary"
+                        : "border-white/10 bg-secondary/60 text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    Todas
+                  </button>
+                  {availablePresentationGroups.map((group) => {
+                    const selected = presentationGroups.includes(group);
+                    return (
+                      <button
+                        key={group}
+                        type="button"
+                        onClick={() => togglePresentationGroup(group)}
+                        className={`press-response rounded-lg border px-2.5 py-1.5 text-xs font-bold transition ${
+                          selected
+                            ? "border-success bg-success/20 text-success"
+                            : "border-white/10 bg-secondary/60 text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        {PRESENTATION_GROUP_LABELS[group]}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  Ej.: elige categoría <strong>Cervezas Artesanales</strong> y marca solo{" "}
+                  <strong>Pinta</strong> o solo <strong>Jirafa</strong> para aplicar a todas las
+                  cervezas en ese formato.
+                </p>
               </div>
             )}
 

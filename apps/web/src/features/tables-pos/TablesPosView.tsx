@@ -11,36 +11,47 @@ import {
   Search,
   ShoppingBag,
   Sparkles,
+  Tag,
   Trash2,
   X,
   Zap,
 } from "lucide-react";
 import {
-  evaluateLinePromotion,
   evaluatePresentationAvailability,
+  getQuickPromoOffersForPresentation,
   isAllyOpenAt,
   type MenuProduct,
   type ProductPresentation,
 } from "@liquistock/domain";
-import { apiFetch, resolveImageUrl } from "../../infrastructure/api/api-client.js";
+import { apiFetch } from "../../infrastructure/api/api-client.js";
 import { localDb } from "../../infrastructure/storage/dexie/db.js";
+import type { LocalSubAccount } from "../../infrastructure/storage/dexie/db.js";
 import type { useLiquiStock } from "../../infrastructure/sync/useLiquiStock.js";
+import { useFeedback } from "../../shared/components/FeedbackProvider.js";
+import { ProductVisualAvatar } from "../../shared/components/ProductTypeIcon.js";
 import { formatCOP, getCurrentIsoDayAndTime } from "../../shared/lib/format.js";
 import { haptics } from "../../shared/lib/haptics.js";
 import { CheckoutModal } from "./CheckoutModal.js";
-import { DigitalReceiptModal, type DigitalReceiptData } from "./DigitalReceiptModal.js";
+import {
+  DigitalReceiptModal,
+  type DigitalReceiptData,
+  type ReceiptBarBranding,
+} from "./DigitalReceiptModal.js";
 
 type StoreType = ReturnType<typeof useLiquiStock>;
 
 export function TablesPosView({
   store,
   isAdmin,
+  barBranding,
   onGoToInventory,
 }: {
   store: StoreType;
   isAdmin: boolean;
+  barBranding?: ReceiptBarBranding;
   onGoToInventory?: () => void;
 }) {
+  const { toast, showAlertModal } = useFeedback();
   const [selectedTableId, setSelectedTableId] = useState<string | null>(
     store.diningTables[0]?.id ?? null,
   );
@@ -51,10 +62,12 @@ export function TablesPosView({
   const [showTablePicker, setShowTablePicker] = useState(false);
   const [showMobileOrderSheet, setShowMobileOrderSheet] = useState(false);
   const [movingItemId, setMovingItemId] = useState<string | null>(null);
+  const [draggingSubAccountId, setDraggingSubAccountId] = useState<string | null>(null);
+  const [isOverTrashZone, setIsOverTrashZone] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
   const [receipt, setReceipt] = useState<DigitalReceiptData | null>(null);
 
-  const { isoDay, hhmm } = getCurrentIsoDayAndTime();
+  const { isoDay, hhmm, yyyymmdd } = getCurrentIsoDayAndTime();
 
   const inventoryMap = useMemo(
     () => new Map(store.inventoryItems.map((i) => [i.id, i])),
@@ -63,6 +76,10 @@ export function TablesPosView({
   const alliesMap = useMemo(
     () => new Map(store.allies.map((a) => [a.id, a])),
     [store.allies],
+  );
+  const promotionRuleById = useMemo(
+    () => new Map(store.promotionRules.map((r) => [r.id, r])),
+    [store.promotionRules],
   );
 
   const closedAllies = useMemo(
@@ -110,6 +127,23 @@ export function TablesPosView({
     return map;
   }, [currentSubItems]);
 
+  // Live count of applied promo lines per (presentationId:promotionRuleId) for 1-tap promo buttons
+  const promoLinesByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const item of currentSubItems) {
+      if (item.promotionRuleId && item.discountAmount > 0) {
+        const key = `${item.presentationId}:${item.promotionRuleId}`;
+        map.set(key, (map.get(key) ?? 0) + 1);
+      }
+    }
+    return map;
+  }, [currentSubItems]);
+
+  const promoLinesCount = useMemo(
+    () => currentSubItems.filter((i) => i.discountAmount > 0).length,
+    [currentSubItems],
+  );
+
   const totalUnitsInSubAccount = useMemo(
     () => currentSubItems.reduce((acc, i) => acc + i.quantity, 0),
     [currentSubItems],
@@ -127,17 +161,8 @@ export function TablesPosView({
   const currentTableLabel =
     store.diningTables.find((t) => t.id === selectedTableId)?.label ?? "Barra Rápida";
 
-  const visibleCatalog = useMemo(() => {
-    const q = search.trim().toLowerCase();
+  const evaluatedCatalog = useMemo(() => {
     return store.menuProducts
-      .filter((p) => (selectedCategoryId === "all" ? true : p.categoryId === selectedCategoryId))
-      .filter((p) => {
-        if (!q) return true;
-        if (p.name.toLowerCase().includes(q)) return true;
-        return store.presentations.some(
-          (pr) => pr.menuProductId === p.id && pr.name.toLowerCase().includes(q),
-        );
-      })
       .map((product) => {
         const presList = store.presentations
           .filter((pr) => pr.menuProductId === product.id)
@@ -152,28 +177,39 @@ export function TablesPosView({
               applyFoamLossFormula: store.featureFlags.enableFoamLossFormula,
               autoHideClosedAllies: store.featureFlags.autoHideClosedAllies,
             });
-            const promoPreview = store.featureFlags.enablePromotions
-              ? evaluateLinePromotion({
-                  line: {
-                    categoryId: product.categoryId,
-                    menuProductId: product.id,
-                    presentationId: presentation.id,
-                    unitPrice: presentation.salePrice,
-                    quantity: 2,
-                  },
+            const promoOffers = store.featureFlags.enablePromotions
+              ? getQuickPromoOffersForPresentation({
+                  categoryId: product.categoryId,
+                  menuProductId: product.id,
+                  presentationId: presentation.id,
+                  presentationGroup: presentation.presentationGroup,
+                  unitPrice: presentation.salePrice,
                   rules: store.promotionRules,
                   isoDayOfWeek: isoDay,
                   currentTimeHHMM: hhmm,
+                  currentDateYYYYMMDD: yyyymmdd,
                 })
-              : null;
+              : [];
+
+            const autoSingleOffer =
+              promoOffers.find((o) => !o.isManual && o.bundleQty === 1) ?? null;
+            const quickOffers = promoOffers.filter((o) => o.bundleQty > 1 || o.isManual);
 
             return {
               presentation,
               availability,
-              promoName: promoPreview?.discountAmount ? promoPreview.promotionName : null,
+              promoOffers,
+              autoSingleOffer,
+              quickOffers,
             };
           })
           .filter((entry) => {
+            if (
+              entry.availability.reason === "PRODUCT_DISABLED" ||
+              entry.availability.reason === "PRESENTATION_DISABLED"
+            ) {
+              return false;
+            }
             if (
               entry.availability.reason === "ALLY_CLOSED" &&
               store.featureFlags.autoHideClosedAllies
@@ -189,7 +225,14 @@ export function TablesPosView({
             return true;
           });
 
-        return { product, entries: presList };
+        return {
+          product,
+          entries: presList,
+          hasActivePromo: presList.some(
+            (e) => e.availability.available && e.promoOffers.length > 0,
+          ),
+          hasEditionTag: Boolean(product.editionTag?.trim()),
+        };
       })
       .filter((group) => group.entries.length > 0);
   }, [
@@ -197,15 +240,46 @@ export function TablesPosView({
     store.presentations,
     store.promotionRules,
     store.featureFlags,
-    selectedCategoryId,
-    search,
     inventoryMap,
     alliesMap,
     isoDay,
     hhmm,
+    yyyymmdd,
   ]);
 
-  const handleTapPresentation = async (product: MenuProduct, presentation: ProductPresentation) => {
+  const promoProductsCount = useMemo(
+    () => evaluatedCatalog.filter((g) => g.hasActivePromo).length,
+    [evaluatedCatalog],
+  );
+
+  const seasonalProductsCount = useMemo(
+    () => evaluatedCatalog.filter((g) => g.hasEditionTag).length,
+    [evaluatedCatalog],
+  );
+
+  const visibleCatalog = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return evaluatedCatalog
+      .filter((group) => {
+        if (selectedCategoryId === "all") return true;
+        if (selectedCategoryId === "__promos__") return group.hasActivePromo;
+        if (selectedCategoryId === "__seasonal__") return group.hasEditionTag;
+        return group.product.categoryId === selectedCategoryId;
+      })
+      .filter((group) => {
+        if (!q) return true;
+        if (group.product.name.toLowerCase().includes(q)) return true;
+        if ((group.product.editionTag ?? "").toLowerCase().includes(q)) return true;
+        return group.entries.some((e) => e.presentation.name.toLowerCase().includes(q));
+      });
+  }, [evaluatedCatalog, selectedCategoryId, search]);
+
+  const handleTapPresentation = async (
+    product: MenuProduct,
+    presentation: ProductPresentation,
+    quantity = 1,
+    forcedPromotionRuleId?: string | null,
+  ) => {
     haptics.tap();
     let targetSubId = currentSubAccount?.id;
     if (!targetSubId) {
@@ -213,7 +287,13 @@ export function TablesPosView({
       targetSubId = opened.subAccountId;
       setSelectedSubAccountId(targetSubId);
     }
-    await store.addOrderItem(targetSubId, product, presentation, 1);
+    await store.addOrderItem(
+      targetSubId,
+      product,
+      presentation,
+      quantity,
+      forcedPromotionRuleId ?? null,
+    );
   };
 
   const handleSplitAccount = async () => {
@@ -223,16 +303,144 @@ export function TablesPosView({
       setSelectedSubAccountId(opened.subAccountId);
       return;
     }
-    const nextNum = sessionSubAccounts.length + 1;
+    const usedLabels = new Set(sessionSubAccounts.map((sa) => sa.label));
+    let nextNum = sessionSubAccounts.length + 1;
+    while (usedLabels.has(`Cuenta ${nextNum}`)) {
+      nextNum += 1;
+    }
     const newId = await store.createSubAccount(activeSession.id, `Cuenta ${nextNum}`);
     setSelectedSubAccountId(newId);
+    toast({
+      kind: "info",
+      title: `Cuenta ${nextNum} creada`,
+      description: `Ya puedes agregar o mover productos a Cuenta ${nextNum} en ${currentTableLabel}.`,
+    });
+  };
+
+  const requestDeleteSubAccount = (sa: LocalSubAccount) => {
+    haptics.tap();
+    const activeItemsInSub = store.orderItems.filter(
+      (i) => i.subAccountId === sa.id && i.status === "active",
+    );
+    const otherOpenSubs = sessionSubAccounts.filter((s) => s.id !== sa.id);
+    const fallbackSub = otherOpenSubs[0] ?? null;
+
+    if (sa.paidAmount > 0 || sa.creditAmount > 0) {
+      haptics.blocked();
+      showAlertModal({
+        tone: "danger",
+        title: `No se puede eliminar ${sa.label}`,
+        description: `Esta cuenta ya tiene pagos o fiado registrados (${formatCOP(
+          sa.paidAmount + sa.creditAmount,
+        )}). Debes finalizar el cobro desde «Cobrar / Fiar» antes de cerrarla.`,
+        actions: [{ label: "Entendido", variant: "primary" }],
+      });
+      return;
+    }
+
+    if (activeItemsInSub.length === 0) {
+      showAlertModal({
+        tone: "warning",
+        title: `¿Eliminar ${sa.label}?`,
+        description: fallbackSub
+          ? `Esta sub-cuenta está vacía. Se cerrará y volverás a ${fallbackSub.label}.`
+          : `Esta cuenta está vacía. Al eliminarla, ${currentTableLabel} volverá a quedar libre.`,
+        actions: [
+          {
+            label: fallbackSub ? `Eliminar ${sa.label}` : "Eliminar y liberar mesa",
+            variant: "danger",
+            onClick: async () => {
+              await store.deleteSubAccount(sa.id, { mode: "empty_only" });
+              if (selectedSubAccountId === sa.id) {
+                setSelectedSubAccountId(fallbackSub?.id ?? null);
+              }
+              setMovingItemId(null);
+              toast({
+                kind: "success",
+                title: `${sa.label} eliminada`,
+                description: fallbackSub
+                  ? `Sub-cuenta cerrada en ${currentTableLabel}.`
+                  : `${currentTableLabel} volvió a quedar libre.`,
+              });
+            },
+          },
+          { label: "Cancelar", variant: "secondary" },
+        ],
+      });
+      return;
+    }
+
+    const unitsCount = activeItemsInSub.reduce((acc, i) => acc + i.quantity, 0);
+    showAlertModal({
+      tone: "warning",
+      title: `${sa.label} tiene ${unitsCount} producto(s) sin cobrar`,
+      description: `Saldo actual: ${formatCOP(sa.totalAmount)}. Elige qué hacer con los pedidos antes de eliminar esta cuenta:`,
+      bulletItems: activeItemsInSub
+        .slice(0, 5)
+        .map(
+          (i) =>
+            `${i.quantity}× ${i.productNameSnap} (${i.presentationNameSnap}) · ${formatCOP(i.lineTotal)}`,
+        ),
+      actions: [
+        ...(fallbackSub
+          ? [
+              {
+                label: `Mover productos a ${fallbackSub.label} y eliminar`,
+                variant: "primary" as const,
+                onClick: async () => {
+                  await store.deleteSubAccount(sa.id, {
+                    mode: "move_items",
+                    targetSubAccountId: fallbackSub.id,
+                  });
+                  setSelectedSubAccountId(fallbackSub.id);
+                  setMovingItemId(null);
+                  toast({
+                    kind: "success",
+                    title: `${sa.label} unificada en ${fallbackSub.label}`,
+                    description: `Se movieron ${unitsCount} producto(s) y se eliminó ${sa.label}.`,
+                  });
+                },
+              },
+            ]
+          : []),
+        {
+          label: fallbackSub
+            ? "Anular productos (devolver stock) y eliminar"
+            : "Anular productos (devolver stock) y liberar mesa",
+          variant: "danger",
+          onClick: async () => {
+            await store.deleteSubAccount(sa.id, {
+              mode: "void_items",
+              reason: `Cuenta ${sa.label} eliminada en POS`,
+            });
+            if (selectedSubAccountId === sa.id) {
+              setSelectedSubAccountId(fallbackSub?.id ?? null);
+            }
+            setMovingItemId(null);
+            toast({
+              kind: "success",
+              title: `${sa.label} eliminada`,
+              description: `Se anularon ${unitsCount} producto(s) y se devolvió el stock.`,
+            });
+          },
+        },
+        { label: "Cancelar", variant: "secondary" },
+      ],
+    });
   };
 
   const handleMoveToSubAccount = async (targetSubId: string) => {
     if (!movingItemId) return;
     haptics.tap();
+    const target = sessionSubAccounts.find((s) => s.id === targetSubId);
     await store.moveOrderItem(movingItemId, targetSubId);
     setMovingItemId(null);
+    if (target) {
+      toast({
+        kind: "success",
+        title: `Producto movido a ${target.label}`,
+      });
+    }
   };
 
   const getTableOpenTotal = (tableId: string | null) => {
@@ -265,6 +473,12 @@ export function TablesPosView({
             <h2 className="font-display text-base font-bold">{currentTableLabel}</h2>
             <p className="text-xs text-muted-foreground">
               {totalUnitsInSubAccount} producto(s) en {currentSubAccount?.label ?? "Cuenta 1"}
+              {promoLinesCount > 0 && (
+                <span className="ml-1.5 inline-flex items-center gap-0.5 rounded-full bg-success/15 px-1.5 py-0.5 text-[10px] font-bold text-success">
+                  <Sparkles className="h-2.5 w-2.5" />
+                  {promoLinesCount} {promoLinesCount === 1 ? "promo" : "promos"}
+                </span>
+              )}
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -291,34 +505,99 @@ export function TablesPosView({
         </div>
 
         {sessionSubAccounts.length > 0 && (
-          <div className="no-scrollbar mt-2.5 flex gap-1.5 overflow-x-auto">
-            {sessionSubAccounts.map((sa) => {
-              const active = sa.id === currentSubAccount?.id;
-              const isMoveTarget = Boolean(movingItemId && !active);
-              return (
-                <button
-                  key={sa.id}
-                  type="button"
-                  onClick={() => {
-                    if (isMoveTarget) {
-                      void handleMoveToSubAccount(sa.id);
-                    } else {
-                      haptics.tap();
-                      setSelectedSubAccountId(sa.id);
-                    }
-                  }}
-                  className={`press-response min-h-10 shrink-0 rounded-xl px-3.5 text-xs font-bold ${
-                    isMoveTarget
-                      ? "animate-pulse bg-warning text-primary-foreground ring-2 ring-warning"
-                      : active
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-secondary/70 text-muted-foreground"
-                  }`}
-                >
-                  {isMoveTarget ? `→ Mover a ${sa.label}` : sa.label}
-                </button>
-              );
-            })}
+          <div className="mt-2.5 flex items-center gap-2">
+            <div className="no-scrollbar flex min-w-0 flex-1 gap-1.5 overflow-x-auto">
+              {sessionSubAccounts.map((sa) => {
+                const active = sa.id === currentSubAccount?.id;
+                const isMoveTarget = Boolean(movingItemId && !active);
+                const isDragging = draggingSubAccountId === sa.id;
+                return (
+                  <div
+                    key={sa.id}
+                    draggable={!isMoveTarget}
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData("text/plain", sa.id);
+                      e.dataTransfer.effectAllowed = "move";
+                      setDraggingSubAccountId(sa.id);
+                    }}
+                    onDragEnd={() => {
+                      setDraggingSubAccountId(null);
+                      setIsOverTrashZone(false);
+                    }}
+                    className={`flex min-h-10 shrink-0 items-center overflow-hidden rounded-xl transition ${
+                      isDragging ? "opacity-50 ring-2 ring-destructive" : ""
+                    } ${
+                      isMoveTarget
+                        ? "animate-pulse bg-warning text-primary-foreground ring-2 ring-warning"
+                        : active
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-secondary/70 text-muted-foreground"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (isMoveTarget) {
+                          void handleMoveToSubAccount(sa.id);
+                        } else {
+                          haptics.tap();
+                          setSelectedSubAccountId(sa.id);
+                        }
+                      }}
+                      className="press-response flex min-h-10 items-center pl-3 pr-2 text-xs font-bold"
+                    >
+                      {isMoveTarget ? `→ Mover a ${sa.label}` : sa.label}
+                    </button>
+                    {!isMoveTarget && (
+                      <button
+                        type="button"
+                        title={`Eliminar ${sa.label} (o arrastra a la papelera)`}
+                        aria-label={`Eliminar ${sa.label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          requestDeleteSubAccount(sa);
+                        }}
+                        className={`press-response mr-1 flex h-7 w-7 items-center justify-center rounded-lg transition ${
+                          active
+                            ? "text-primary-foreground/75 hover:bg-black/15 hover:text-primary-foreground"
+                            : "text-muted-foreground hover:bg-destructive/20 hover:text-destructive"
+                        }`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Papelera desplegable en la esquina al arrastrar una cuenta */}
+            {draggingSubAccountId && (
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  setIsOverTrashZone(true);
+                }}
+                onDragLeave={() => setIsOverTrashZone(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const droppedId = e.dataTransfer.getData("text/plain") || draggingSubAccountId;
+                  setDraggingSubAccountId(null);
+                  setIsOverTrashZone(false);
+                  const targetSub = sessionSubAccounts.find((s) => s.id === droppedId);
+                  if (targetSub) requestDeleteSubAccount(targetSub);
+                }}
+                className={`flex min-h-10 shrink-0 items-center gap-1.5 rounded-xl border-2 border-dashed px-3 text-xs font-bold transition ${
+                  isOverTrashZone
+                    ? "scale-105 border-destructive bg-destructive text-white"
+                    : "border-destructive/60 bg-destructive/15 text-destructive"
+                }`}
+              >
+                <Trash2 className="h-4 w-4" />
+                <span>Soltar</span>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -333,13 +612,19 @@ export function TablesPosView({
         ) : (
           currentSubItems.map((item) => {
             const isMovingThis = movingItemId === item.id;
+            const appliedPromo = item.promotionRuleId
+              ? promotionRuleById.get(item.promotionRuleId) ?? null
+              : null;
+            const grossLine = item.unitPriceSnap * item.quantity;
             return (
               <div
                 key={item.id}
                 className={`rounded-xl border p-3 ${
                   isMovingThis
                     ? "border-warning bg-warning/10"
-                    : "border-white/10 bg-background/60"
+                    : item.discountAmount > 0
+                      ? "border-success/30 bg-success/5"
+                      : "border-white/10 bg-background/60"
                 }`}
               >
                 <div className="flex items-start justify-between gap-2">
@@ -352,14 +637,24 @@ export function TablesPosView({
                       {item.allyIdSnap ? " · Aliado" : ""}
                     </p>
                     {item.discountAmount > 0 && (
-                      <span className="mt-1 inline-block rounded bg-success/15 px-1.5 py-0.5 text-[11px] font-bold text-success">
-                        Promo (-{formatCOP(item.discountAmount)})
+                      <span className="mt-1 inline-flex items-center gap-1 rounded-md bg-success/15 px-1.5 py-0.5 text-[11px] font-bold text-success">
+                        <Sparkles className="h-3 w-3 shrink-0" />
+                        {appliedPromo
+                          ? `Promo: ${appliedPromo.name} (-${formatCOP(item.discountAmount)})`
+                          : `Promo (-${formatCOP(item.discountAmount)})`}
                       </span>
                     )}
                   </div>
-                  <p className="shrink-0 text-sm font-bold tabular-nums text-foreground">
-                    {formatCOP(item.lineTotal)}
-                  </p>
+                  <div className="shrink-0 text-right tabular-nums">
+                    {item.discountAmount > 0 && grossLine > item.lineTotal && (
+                      <p className="text-[11px] text-muted-foreground line-through">
+                        {formatCOP(grossLine)}
+                      </p>
+                    )}
+                    <p className="text-sm font-bold text-foreground">
+                      {formatCOP(item.lineTotal)}
+                    </p>
+                  </div>
                 </div>
 
                 <div className="mt-2.5 flex items-center justify-end gap-2">
@@ -513,6 +808,40 @@ export function TablesPosView({
           >
             Todo
           </button>
+          {promoProductsCount > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                haptics.tap();
+                setSelectedCategoryId("__promos__");
+              }}
+              className={`press-response flex min-h-10 shrink-0 items-center gap-1.5 rounded-full px-3.5 text-xs font-bold ${
+                selectedCategoryId === "__promos__"
+                  ? "bg-success text-primary-foreground"
+                  : "border border-success/40 bg-success/12 text-success"
+              }`}
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              Promos hoy ({promoProductsCount})
+            </button>
+          )}
+          {seasonalProductsCount > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                haptics.tap();
+                setSelectedCategoryId("__seasonal__");
+              }}
+              className={`press-response flex min-h-10 shrink-0 items-center gap-1.5 rounded-full px-3.5 text-xs font-bold ${
+                selectedCategoryId === "__seasonal__"
+                  ? "bg-accent text-primary-foreground"
+                  : "border border-accent/40 bg-accent/12 text-accent"
+              }`}
+            >
+              <Tag className="h-3.5 w-3.5" />
+              Temporada ({seasonalProductsCount})
+            </button>
+          )}
           {store.categories.map((cat) => (
             <button
               key={cat.id}
@@ -614,6 +943,34 @@ export function TablesPosView({
             >
               Todo
             </button>
+            {promoProductsCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedCategoryId("__promos__")}
+                className={`press-response flex min-h-10 items-center gap-1.5 rounded-xl px-3.5 text-xs font-bold ${
+                  selectedCategoryId === "__promos__"
+                    ? "bg-success text-primary-foreground"
+                    : "border border-success/40 bg-success/12 text-success"
+                }`}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                Promos hoy ({promoProductsCount})
+              </button>
+            )}
+            {seasonalProductsCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedCategoryId("__seasonal__")}
+                className={`press-response flex min-h-10 items-center gap-1.5 rounded-xl px-3.5 text-xs font-bold ${
+                  selectedCategoryId === "__seasonal__"
+                    ? "bg-accent text-primary-foreground"
+                    : "border border-accent/40 bg-accent/12 text-accent"
+                }`}
+              >
+                <Tag className="h-3.5 w-3.5" />
+                Temporada ({seasonalProductsCount})
+              </button>
+            )}
             {store.categories.map((cat) => (
               <button
                 key={cat.id}
@@ -669,7 +1026,6 @@ export function TablesPosView({
             ) : (
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {visibleCatalog.map(({ product, entries }) => {
-                  const imgUrl = resolveImageUrl(product.imageUrl);
                   const singleEntry = entries.length === 1 ? entries[0] : null;
 
                   return (
@@ -679,27 +1035,24 @@ export function TablesPosView({
                     >
                       {/* Cabecera clara y limpia del producto */}
                       <div className="flex items-center gap-3">
-                        {imgUrl ? (
-                          <img
-                            src={imgUrl}
-                            alt={product.name}
-                            loading="lazy"
-                            className="h-14 w-14 shrink-0 rounded-xl object-cover ring-1 ring-white/10"
-                          />
-                        ) : (
-                          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-primary/12 text-primary">
-                            {product.allyId ? (
-                              <Handshake className="h-6 w-6 text-warning" />
-                            ) : (
-                              <Beer className="h-6 w-6" />
-                            )}
-                          </div>
-                        )}
+                        <ProductVisualAvatar
+                          imageUrl={product.imageUrl}
+                          name={product.name}
+                          productKind={product.productKind}
+                          allyId={product.allyId}
+                          presentationGroup={entries[0]?.presentation.presentationGroup}
+                        />
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <h3 className="truncate font-display text-base font-bold leading-snug text-foreground">
                               {product.name}
                             </h3>
+                            {product.editionTag && (
+                              <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent/20 px-2 py-0.5 text-[10px] font-bold text-accent ring-1 ring-accent/35">
+                                <Tag className="h-2.5 w-2.5" />
+                                {product.editionTag}
+                              </span>
+                            )}
                             {product.allyId && (
                               <span className="shrink-0 rounded-full bg-warning/15 px-2 py-0.5 text-[11px] font-bold text-warning">
                                 Aliado
@@ -717,77 +1070,13 @@ export function TablesPosView({
                       {/* Botón único ancho si solo tiene 1 presentación, o grid de botones táctiles grandes si tiene varias */}
                       {singleEntry ? (
                         (() => {
-                          const { presentation, availability, promoName } = singleEntry;
+                          const { presentation, availability, autoSingleOffer, quickOffers } =
+                            singleEntry;
                           const disabled = !availability.available;
                           const inCartQty = qtyByPresentationId.get(presentation.id) ?? 0;
                           return (
-                            <button
-                              type="button"
-                              disabled={disabled}
-                              onClick={() => {
-                                if (disabled) {
-                                  haptics.blocked();
-                                  return;
-                                }
-                                void handleTapPresentation(product, presentation);
-                              }}
-                              className={`press-response flex min-h-14 w-full items-center justify-between gap-2 rounded-xl border px-4 ${
-                                disabled
-                                  ? "cursor-not-allowed border-destructive/30 bg-destructive/10 opacity-65"
-                                  : inCartQty > 0
-                                    ? "border-primary/60 bg-primary/15"
-                                    : "border-white/10 bg-secondary/75"
-                              }`}
-                            >
-                              <div className="flex items-center gap-2">
-                                <span className="text-base font-bold tabular-nums text-primary">
-                                  {formatCOP(presentation.salePrice)}
-                                </span>
-                                {promoName && !disabled && (
-                                  <span className="flex items-center gap-1 rounded-full bg-success/20 px-2 py-0.5 text-[11px] font-bold text-success">
-                                    <Sparkles className="h-3 w-3" />
-                                    Promo
-                                  </span>
-                                )}
-                              </div>
-
-                              <div className="flex items-center gap-2">
-                                {disabled ? (
-                                  <span className="rounded-lg bg-destructive/20 px-2.5 py-1 text-xs font-bold text-destructive">
-                                    Agotado
-                                  </span>
-                                ) : (
-                                  <>
-                                    {availability.isLowStock &&
-                                      availability.maxServings !== null && (
-                                        <span className="rounded-lg bg-warning/20 px-2 py-0.5 text-[11px] font-bold text-warning">
-                                          Quedan {availability.maxServings}
-                                        </span>
-                                      )}
-                                    {inCartQty > 0 ? (
-                                      <span className="flex h-8 min-w-8 items-center justify-center rounded-full bg-primary px-2 text-xs font-bold tabular-nums text-primary-foreground">
-                                        {inCartQty}
-                                      </span>
-                                    ) : (
-                                      <span className="flex items-center gap-1 rounded-lg bg-primary/20 px-3 py-1.5 text-xs font-bold text-primary">
-                                        <Plus className="h-3.5 w-3.5" />
-                                        Agregar
-                                      </span>
-                                    )}
-                                  </>
-                                )}
-                              </div>
-                            </button>
-                          );
-                        })()
-                      ) : (
-                        <div className="grid grid-cols-2 gap-2">
-                          {entries.map(({ presentation, availability, promoName }) => {
-                            const disabled = !availability.available;
-                            const inCartQty = qtyByPresentationId.get(presentation.id) ?? 0;
-                            return (
+                            <div className="space-y-2">
                               <button
-                                key={presentation.id}
                                 type="button"
                                 disabled={disabled}
                                 onClick={() => {
@@ -795,48 +1084,307 @@ export function TablesPosView({
                                     haptics.blocked();
                                     return;
                                   }
-                                  void handleTapPresentation(product, presentation);
+                                  void handleTapPresentation(product, presentation, 1);
                                 }}
-                                className={`press-response relative flex min-h-16 flex-col justify-between rounded-xl border p-3 text-left ${
+                                className={`press-response flex min-h-14 w-full items-center justify-between gap-2 rounded-xl border px-4 ${
                                   disabled
                                     ? "cursor-not-allowed border-destructive/30 bg-destructive/10 opacity-65"
                                     : inCartQty > 0
-                                      ? "border-primary/65 bg-primary/15"
+                                      ? "border-primary/60 bg-primary/15"
                                       : "border-white/10 bg-secondary/75"
                                 }`}
                               >
-                                <div className="flex w-full items-start justify-between gap-1.5">
-                                  <span className="text-[13px] font-semibold leading-tight text-foreground">
-                                    {presentation.shortLabel ?? presentation.name}
-                                  </span>
-                                  {inCartQty > 0 && !disabled && (
-                                    <span className="flex h-6 min-w-6 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-bold tabular-nums text-primary-foreground">
-                                      {inCartQty}
+                                <div className="flex flex-wrap items-center gap-2">
+                                  {autoSingleOffer && !disabled ? (
+                                    <>
+                                      <span className="text-base font-bold tabular-nums text-success">
+                                        {formatCOP(autoSingleOffer.promoTotal)}
+                                      </span>
+                                      <span className="text-xs tabular-nums text-muted-foreground line-through">
+                                        {formatCOP(presentation.salePrice)}
+                                      </span>
+                                      <span className="flex items-center gap-1 rounded-full bg-success/20 px-2 py-0.5 text-[11px] font-bold text-success">
+                                        <Sparkles className="h-3 w-3" />
+                                        {autoSingleOffer.shortBadge}
+                                      </span>
+                                    </>
+                                  ) : (
+                                    <span className="text-base font-bold tabular-nums text-primary">
+                                      {formatCOP(presentation.salePrice)}
                                     </span>
-                                  )}
-                                  {inCartQty === 0 && promoName && !disabled && (
-                                    <Sparkles className="h-3.5 w-3.5 shrink-0 text-success" />
                                   )}
                                 </div>
 
-                                <div className="mt-1.5 flex w-full items-end justify-between gap-1">
-                                  <span className="text-[15px] font-bold tabular-nums text-primary">
-                                    {formatCOP(presentation.salePrice)}
-                                  </span>
+                                <div className="flex items-center gap-2">
                                   {disabled ? (
-                                    <span className="rounded bg-destructive/20 px-1.5 py-0.5 text-[10px] font-bold text-destructive">
+                                    <span className="rounded-lg bg-destructive/20 px-2.5 py-1 text-xs font-bold text-destructive">
                                       Agotado
                                     </span>
-                                  ) : availability.isLowStock &&
-                                    availability.maxServings !== null ? (
-                                    <span className="rounded bg-warning/20 px-1.5 py-0.5 text-[10px] font-bold text-warning">
-                                      Quedan {availability.maxServings}
-                                    </span>
-                                  ) : null}
+                                  ) : (
+                                    <>
+                                      {availability.isLowStock &&
+                                        availability.maxServings !== null && (
+                                          <span className="rounded-lg bg-warning/20 px-2 py-0.5 text-[11px] font-bold text-warning">
+                                            Quedan {availability.maxServings}
+                                          </span>
+                                        )}
+                                      {inCartQty > 0 ? (
+                                        <span className="flex h-8 min-w-8 items-center justify-center rounded-full bg-primary px-2 text-xs font-bold tabular-nums text-primary-foreground">
+                                          {inCartQty}
+                                        </span>
+                                      ) : (
+                                        <span className="flex items-center gap-1 rounded-lg bg-primary/20 px-3 py-1.5 text-xs font-bold text-primary">
+                                          <Plus className="h-3.5 w-3.5" />
+                                          1 und
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
                                 </div>
                               </button>
+
+                              {/* Botones rápidos de Promoción 1 toque (2x1, 3x2, promos de hoy) */}
+                              {!disabled && quickOffers.length > 0 && (
+                                <div className="space-y-1.5">
+                                  {quickOffers.map((offer) => {
+                                    const canFulfill =
+                                      availability.maxServings === null ||
+                                      availability.maxServings >= offer.bundleQty;
+                                    const appliedCount =
+                                      promoLinesByKey.get(`${presentation.id}:${offer.rule.id}`) ??
+                                      0;
+                                    return (
+                                      <button
+                                        key={offer.rule.id}
+                                        type="button"
+                                        disabled={!canFulfill}
+                                        onClick={() => {
+                                          if (!canFulfill) {
+                                            haptics.blocked();
+                                            return;
+                                          }
+                                          void handleTapPresentation(
+                                            product,
+                                            presentation,
+                                            offer.bundleQty,
+                                            offer.rule.id,
+                                          );
+                                        }}
+                                        className={`press-response flex min-h-12 w-full items-center justify-between gap-2 rounded-xl border px-3.5 py-2 text-left transition ${
+                                          !canFulfill
+                                            ? "cursor-not-allowed border-white/10 bg-secondary/40 opacity-50"
+                                            : appliedCount > 0
+                                              ? "border-success/65 bg-success/18"
+                                              : "border-success/40 bg-success/10 hover:bg-success/16"
+                                        }`}
+                                      >
+                                        <div className="flex min-w-0 items-center gap-2">
+                                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-success/20 text-success">
+                                            <Sparkles className="h-3.5 w-3.5" />
+                                          </span>
+                                          <div className="min-w-0">
+                                            <p className="flex items-center gap-1.5 text-xs font-bold text-success">
+                                              <span>
+                                                +{offer.bundleQty} · {offer.shortBadge}
+                                              </span>
+                                              {appliedCount > 0 && (
+                                                <span className="rounded-full bg-success px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-primary-foreground">
+                                                  ×{appliedCount}
+                                                </span>
+                                              )}
+                                            </p>
+                                            <p className="truncate text-[11px] text-muted-foreground">
+                                              {offer.rule.name}
+                                            </p>
+                                          </div>
+                                        </div>
+
+                                        <div className="shrink-0 text-right tabular-nums">
+                                          {canFulfill ? (
+                                            <>
+                                              <p className="text-sm font-bold text-success">
+                                                {formatCOP(offer.promoTotal)}
+                                              </p>
+                                              <p className="text-[10px] text-muted-foreground line-through">
+                                                {formatCOP(offer.regularTotal)}
+                                              </p>
+                                            </>
+                                          ) : (
+                                            <span className="rounded bg-destructive/20 px-1.5 py-0.5 text-[10px] font-bold text-destructive">
+                                              Stock insuf.
+                                            </span>
+                                          )}
+                                        </div>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()
+                      ) : (
+                        <div className="space-y-2">
+                          <div className="grid grid-cols-2 gap-2">
+                            {entries.map(
+                              ({ presentation, availability, autoSingleOffer, quickOffers }) => {
+                                const disabled = !availability.available;
+                                const inCartQty = qtyByPresentationId.get(presentation.id) ?? 0;
+                                return (
+                                  <button
+                                    key={presentation.id}
+                                    type="button"
+                                    disabled={disabled}
+                                    onClick={() => {
+                                      if (disabled) {
+                                        haptics.blocked();
+                                        return;
+                                      }
+                                      void handleTapPresentation(product, presentation, 1);
+                                    }}
+                                    className={`press-response relative flex min-h-16 flex-col justify-between rounded-xl border p-3 text-left ${
+                                      disabled
+                                        ? "cursor-not-allowed border-destructive/30 bg-destructive/10 opacity-65"
+                                        : inCartQty > 0
+                                          ? "border-primary/65 bg-primary/15"
+                                          : "border-white/10 bg-secondary/75"
+                                    }`}
+                                  >
+                                    <div className="flex w-full items-start justify-between gap-1.5">
+                                      <span className="text-[13px] font-semibold leading-tight text-foreground">
+                                        {presentation.shortLabel ?? presentation.name}
+                                      </span>
+                                      {inCartQty > 0 && !disabled && (
+                                        <span className="flex h-6 min-w-6 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-bold tabular-nums text-primary-foreground">
+                                          {inCartQty}
+                                        </span>
+                                      )}
+                                      {inCartQty === 0 &&
+                                        (autoSingleOffer || quickOffers.length > 0) &&
+                                        !disabled && (
+                                          <Sparkles className="h-3.5 w-3.5 shrink-0 text-success" />
+                                        )}
+                                    </div>
+
+                                    <div className="mt-1.5 flex w-full items-end justify-between gap-1">
+                                      {autoSingleOffer && !disabled ? (
+                                        <div className="flex flex-wrap items-baseline gap-1">
+                                          <span className="text-[15px] font-bold tabular-nums text-success">
+                                            {formatCOP(autoSingleOffer.promoTotal)}
+                                          </span>
+                                          <span className="text-[10px] tabular-nums text-muted-foreground line-through">
+                                            {formatCOP(presentation.salePrice)}
+                                          </span>
+                                        </div>
+                                      ) : (
+                                        <span className="text-[15px] font-bold tabular-nums text-primary">
+                                          {formatCOP(presentation.salePrice)}
+                                        </span>
+                                      )}
+                                      {disabled ? (
+                                        <span className="rounded bg-destructive/20 px-1.5 py-0.5 text-[10px] font-bold text-destructive">
+                                          Agotado
+                                        </span>
+                                      ) : availability.isLowStock &&
+                                        availability.maxServings !== null ? (
+                                        <span className="rounded bg-warning/20 px-1.5 py-0.5 text-[10px] font-bold text-warning">
+                                          Quedan {availability.maxServings}
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                  </button>
+                                );
+                              },
+                            )}
+                          </div>
+
+                          {/* Accesos rápidos de Promoción 1 toque para presentaciones de este producto */}
+                          {(() => {
+                            const quickRows = entries.flatMap((entry) =>
+                              entry.availability.available
+                                ? entry.quickOffers.map((offer) => ({ entry, offer }))
+                                : [],
                             );
-                          })}
+                            if (quickRows.length === 0) return null;
+                            return (
+                              <div className="space-y-1.5 border-t border-white/10 pt-2">
+                                {quickRows.map(({ entry, offer }) => {
+                                  const canFulfill =
+                                    entry.availability.maxServings === null ||
+                                    entry.availability.maxServings >= offer.bundleQty;
+                                  const appliedCount =
+                                    promoLinesByKey.get(
+                                      `${entry.presentation.id}:${offer.rule.id}`,
+                                    ) ?? 0;
+                                  return (
+                                    <button
+                                      key={`${entry.presentation.id}:${offer.rule.id}`}
+                                      type="button"
+                                      disabled={!canFulfill}
+                                      onClick={() => {
+                                        if (!canFulfill) {
+                                          haptics.blocked();
+                                          return;
+                                        }
+                                        void handleTapPresentation(
+                                          product,
+                                          entry.presentation,
+                                          offer.bundleQty,
+                                          offer.rule.id,
+                                        );
+                                      }}
+                                      className={`press-response flex min-h-11 w-full items-center justify-between gap-2 rounded-xl border px-3 py-1.5 text-left transition ${
+                                        !canFulfill
+                                          ? "cursor-not-allowed border-white/10 bg-secondary/40 opacity-50"
+                                          : appliedCount > 0
+                                            ? "border-success/65 bg-success/18"
+                                            : "border-success/40 bg-success/10 hover:bg-success/16"
+                                      }`}
+                                    >
+                                      <div className="flex min-w-0 items-center gap-2">
+                                        <Sparkles className="h-3.5 w-3.5 shrink-0 text-success" />
+                                        <div className="min-w-0">
+                                          <p className="flex items-center gap-1.5 truncate text-xs font-bold text-success">
+                                            <span>
+                                              +{offer.bundleQty}{" "}
+                                              {entry.presentation.shortLabel ??
+                                                entry.presentation.name}{" "}
+                                              · {offer.shortBadge}
+                                            </span>
+                                            {appliedCount > 0 && (
+                                              <span className="rounded-full bg-success px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-primary-foreground">
+                                                ×{appliedCount}
+                                              </span>
+                                            )}
+                                          </p>
+                                          <p className="truncate text-[10px] text-muted-foreground">
+                                            {offer.rule.name}
+                                          </p>
+                                        </div>
+                                      </div>
+
+                                      <div className="shrink-0 text-right tabular-nums">
+                                        {canFulfill ? (
+                                          <>
+                                            <p className="text-xs font-bold text-success">
+                                              {formatCOP(offer.promoTotal)}
+                                            </p>
+                                            <p className="text-[10px] text-muted-foreground line-through">
+                                              {formatCOP(offer.regularTotal)}
+                                            </p>
+                                          </>
+                                        ) : (
+                                          <span className="rounded bg-destructive/20 px-1.5 py-0.5 text-[10px] font-bold text-destructive">
+                                            Stock insuf.
+                                          </span>
+                                        )}
+                                      </div>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })()}
                         </div>
                       )}
                     </article>
@@ -1082,6 +1630,7 @@ export function TablesPosView({
               setShowCheckout(false);
               setReceipt({
                 branchName: store.branch?.name ?? "LiquiStock Bar",
+                barBranding,
                 tableLabel: currentTableLabel,
                 subAccountLabel: currentSubAccount.label,
                 closedAt: new Date().toISOString(),
@@ -1099,6 +1648,7 @@ export function TablesPosView({
             setShowCheckout(false);
             setReceipt({
               branchName: store.branch?.name ?? "LiquiStock Bar",
+              barBranding,
               tableLabel: currentTableLabel,
               subAccountLabel: currentSubAccount.label,
               closedAt: new Date().toISOString(),

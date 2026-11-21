@@ -9,6 +9,7 @@ import {
   type BranchFeatureFlags,
   type Customer,
   type OfflineSyncCommand,
+  type PresentationGroup,
   type ProductKind,
   type ProductPresentation,
   type PromotionRule,
@@ -83,6 +84,7 @@ async function applyPromotionRuleToSubAccount(
   client: DbClient,
   subAccountId: string,
   rule: PromotionRule,
+  options?: { skipManualPromoLines?: boolean },
 ): Promise<void> {
   // Only re-price active items without a manual courtesy/price override
   const linesRes = await client.query<{
@@ -90,16 +92,28 @@ async function applyPromotionRuleToSubAccount(
     category_id: string;
     menu_product_id: string;
     presentation_id: string;
+    presentation_group_snap: string;
     unit_price_snap: string;
     quantity: number;
     discount_amount: string;
   }>(
-    `SELECT oi.id, mp.category_id, oi.menu_product_id, oi.presentation_id,
-            oi.unit_price_snap::text, oi.quantity, oi.discount_amount::text
-     FROM order_items oi
-     JOIN menu_products mp ON mp.id = oi.menu_product_id
-     WHERE oi.sub_account_id = $1 AND oi.status = 'active' AND oi.adjustment_reason IS NULL
-     ORDER BY oi.created_at ASC`,
+    options?.skipManualPromoLines
+      ? `SELECT oi.id, mp.category_id, oi.menu_product_id, oi.presentation_id,
+                oi.presentation_group_snap, oi.unit_price_snap::text, oi.quantity, oi.discount_amount::text
+         FROM order_items oi
+         JOIN menu_products mp ON mp.id = oi.menu_product_id
+         LEFT JOIN promotion_rules pr ON pr.id = oi.promotion_rule_id
+         WHERE oi.sub_account_id = $1
+           AND oi.status = 'active'
+           AND oi.adjustment_reason IS NULL
+           AND (pr.id IS NULL OR pr.application_mode <> 'manual_at_checkout')
+         ORDER BY oi.created_at ASC`
+      : `SELECT oi.id, mp.category_id, oi.menu_product_id, oi.presentation_id,
+                oi.presentation_group_snap, oi.unit_price_snap::text, oi.quantity, oi.discount_amount::text
+         FROM order_items oi
+         JOIN menu_products mp ON mp.id = oi.menu_product_id
+         WHERE oi.sub_account_id = $1 AND oi.status = 'active' AND oi.adjustment_reason IS NULL
+         ORDER BY oi.created_at ASC`,
     [subAccountId],
   );
 
@@ -108,6 +122,7 @@ async function applyPromotionRuleToSubAccount(
     categoryId: r.category_id,
     menuProductId: r.menu_product_id,
     presentationId: r.presentation_id,
+    presentationGroup: r.presentation_group_snap as PresentationGroup,
     unitPrice: Number(r.unit_price_snap),
     quantity: r.quantity,
   }));
@@ -171,6 +186,91 @@ async function closeSessionIfAllSubAccountsClosed(client: DbClient, subAccountId
       [sessionId],
     );
   }
+}
+
+async function voidOrderItemInTx(
+  client: DbClient,
+  orderItemId: string,
+  reason: string,
+  branchId: string,
+  userId: string,
+): Promise<string | null> {
+  const itemRes = await client.query<{ sub_account_id: string; status: string }>(
+    `SELECT sub_account_id, status FROM order_items WHERE id = $1`,
+    [orderItemId],
+  );
+  const item = itemRes.rows[0];
+  if (!item || item.status === "voided") return null;
+
+  await client.query(
+    `UPDATE order_items SET status = 'voided', void_reason = $2, voided_by = $3 WHERE id = $1`,
+    [orderItemId, reason, userId],
+  );
+
+  // Compensating reversal in immutable inventory_ledger
+  const origLedger = await client.query<{
+    inventory_item_id: string;
+    quantity_delta_base: string;
+    nominal_qty_base: string;
+    pour_loss_qty_base: string;
+    unit_cost_base: string;
+  }>(
+    `SELECT inventory_item_id, quantity_delta_base::text, nominal_qty_base::text,
+            pour_loss_qty_base::text, unit_cost_base::text
+     FROM inventory_ledger
+     WHERE reference_type = 'order_item' AND reference_id = $1 AND movement_type = 'sale'`,
+    [orderItemId],
+  );
+
+  for (const row of origLedger.rows) {
+    const restoreDelta = Math.abs(Number(row.quantity_delta_base));
+    const inv = await client.query<{ current_stock_base: string }>(
+      `SELECT current_stock_base::text FROM inventory_items WHERE id = $1 FOR UPDATE`,
+      [row.inventory_item_id],
+    );
+    const nextStock =
+      Math.round((Number(inv.rows[0]?.current_stock_base ?? "0") + restoreDelta) * 1000) / 1000;
+
+    await client.query(
+      `UPDATE inventory_items SET current_stock_base = $2, updated_at = now() WHERE id = $1`,
+      [row.inventory_item_id, nextStock],
+    );
+
+    await client.query(
+      `INSERT INTO inventory_ledger (
+         id, branch_id, inventory_item_id, movement_type,
+         quantity_delta_base, nominal_qty_base, pour_loss_qty_base,
+         stock_after_base, unit_cost_base, reference_type, reference_id,
+         reason, created_by, idempotency_key
+       ) VALUES (
+         $1, $2, $3, 'sale_void_reversal',
+         $4, $5, $6,
+         $7, $8, 'order_item', $9,
+         $10, $11, $12
+       )`,
+      [
+        generateUuidV7(),
+        branchId,
+        row.inventory_item_id,
+        restoreDelta,
+        -Number(row.nominal_qty_base),
+        -Number(row.pour_loss_qty_base),
+        nextStock,
+        Number(row.unit_cost_base),
+        orderItemId,
+        `Reversión anulación: ${reason}`,
+        userId,
+        generateUuidV7(),
+      ],
+    );
+  }
+
+  await client.query(
+    `UPDATE ally_settlement_entries SET status = 'voided' WHERE order_item_id = $1`,
+    [orderItemId],
+  );
+
+  return item.sub_account_id;
 }
 
 async function getActiveCashShiftId(client: DbClient, branchId: string, fallbackUserId: string): Promise<string> {
@@ -258,11 +358,119 @@ export class PostgresSyncRepository implements ISyncRepository {
           break;
         }
 
+        case "DELETE_SUB_ACCOUNT": {
+          const subAccountId = String(payload.subAccountId);
+          const mode = (payload.mode as "empty_only" | "move_items" | "void_items" | undefined) ?? "empty_only";
+          const targetSubAccountId =
+            typeof payload.targetSubAccountId === "string" && payload.targetSubAccountId.trim()
+              ? payload.targetSubAccountId.trim()
+              : null;
+          const reason = String(payload.reason ?? "Cuenta eliminada en POS");
+
+          const subRes = await client.query<{
+            status: string;
+            table_session_id: string;
+            paid_amount: string;
+            credit_amount: string;
+          }>(
+            `SELECT status, table_session_id, paid_amount::text, credit_amount::text
+             FROM sub_accounts
+             WHERE id = $1 AND branch_id = $2
+             FOR UPDATE`,
+            [subAccountId, command.branchId],
+          );
+          const sub = subRes.rows[0];
+          if (!sub || sub.status !== "open") break;
+
+          if (Number(sub.paid_amount) > 0 || Number(sub.credit_amount) > 0) {
+            await client.query(
+              `UPDATE sync_processed_events SET result_status = 'conflict_flagged' WHERE idempotency_key = $1`,
+              [command.idempotencyKey],
+            );
+            return {
+              idempotencyKey: command.idempotencyKey,
+              status: "conflict_flagged",
+              detail: "No se puede eliminar una sub-cuenta que ya tiene abonos o fiado registrados.",
+            };
+          }
+
+          const activeItemsRes = await client.query<{ id: string }>(
+            `SELECT id FROM order_items WHERE sub_account_id = $1 AND status = 'active'`,
+            [subAccountId],
+          );
+
+          if (activeItemsRes.rows.length > 0) {
+            if (mode === "move_items" && targetSubAccountId && targetSubAccountId !== subAccountId) {
+              const targetCheck = await client.query<{ id: string }>(
+                `SELECT id FROM sub_accounts
+                 WHERE id = $1 AND table_session_id = $2 AND status = 'open'`,
+                [targetSubAccountId, sub.table_session_id],
+              );
+              if (targetCheck.rows.length === 0) {
+                await client.query(
+                  `UPDATE sync_processed_events SET result_status = 'conflict_flagged' WHERE idempotency_key = $1`,
+                  [command.idempotencyKey],
+                );
+                return {
+                  idempotencyKey: command.idempotencyKey,
+                  status: "conflict_flagged",
+                  detail: "La sub-cuenta destino no está abierta en esta mesa.",
+                };
+              }
+              for (const row of activeItemsRes.rows) {
+                await client.query(`UPDATE order_items SET sub_account_id = $2 WHERE id = $1`, [
+                  row.id,
+                  targetSubAccountId,
+                ]);
+                await client.query(
+                  `INSERT INTO order_item_transfers (id, order_item_id, from_sub_account_id, to_sub_account_id, moved_by, idempotency_key)
+                   VALUES ($1, $2, $3, $4, $5, $6)`,
+                  [generateUuidV7(), row.id, subAccountId, targetSubAccountId, command.userId, generateUuidV7()],
+                );
+              }
+              await recalculateSubAccountTotals(client, targetSubAccountId);
+            } else if (mode === "void_items") {
+              for (const row of activeItemsRes.rows) {
+                await voidOrderItemInTx(client, row.id, reason, command.branchId, command.userId);
+              }
+            } else {
+              await client.query(
+                `UPDATE sync_processed_events SET result_status = 'conflict_flagged' WHERE idempotency_key = $1`,
+                [command.idempotencyKey],
+              );
+              return {
+                idempotencyKey: command.idempotencyKey,
+                status: "conflict_flagged",
+                detail: "La sub-cuenta aún tiene productos activos.",
+              };
+            }
+          }
+
+          await client.query(
+            `UPDATE sub_accounts
+             SET status = 'voided',
+                 subtotal_amount = 0,
+                 discount_amount = 0,
+                 total_amount = 0,
+                 version = version + 1,
+                 updated_at = now()
+             WHERE id = $1`,
+            [subAccountId],
+          );
+
+          await closeSessionIfAllSubAccountsClosed(client, subAccountId);
+          break;
+        }
+
         case "ADD_ORDER_ITEM": {
           const orderItemId = String(payload.orderItemId ?? generateUuidV7());
           let subAccountId = String(payload.subAccountId);
           const presentationId = String(payload.presentationId);
           const quantity = Math.max(1, Math.trunc(Number(payload.quantity ?? 1)));
+          const forcedPromotionRuleId =
+            typeof payload.forcedPromotionRuleId === "string" && payload.forcedPromotionRuleId.trim()
+              ? payload.forcedPromotionRuleId.trim()
+              : null;
 
           // Check sub-account status for multi-tablet offline conflict safety
           const subRes = await client.query<{ status: string; table_session_id: string }>(
@@ -357,6 +565,7 @@ export class PostgresSyncRepository implements ISyncRepository {
                 categoryId: pres.category_id,
                 menuProductId: pres.menu_product_id,
                 presentationId: pres.id,
+                presentationGroup: pres.presentation_group as PresentationGroup,
                 unitPrice,
                 quantity,
               },
@@ -364,6 +573,7 @@ export class PostgresSyncRepository implements ISyncRepository {
               isoDayOfWeek: clock.isoDay,
               currentTimeHHMM: clock.hhmm,
               currentDateYYYYMMDD: clock.yyyymmdd,
+              forcedRuleId: forcedPromotionRuleId,
             });
             promotionRuleId = promoRes.promotionRuleId;
             discountAmount = promoRes.discountAmount;
@@ -506,7 +716,9 @@ export class PostgresSyncRepository implements ISyncRepository {
                 }),
             );
             for (const rule of eligibleAuto) {
-              await applyPromotionRuleToSubAccount(client, subAccountId, rule);
+              await applyPromotionRuleToSubAccount(client, subAccountId, rule, {
+                skipManualPromoLines: true,
+              });
             }
           }
 
@@ -526,82 +738,16 @@ export class PostgresSyncRepository implements ISyncRepository {
           const orderItemId = String(payload.orderItemId);
           const reason = String(payload.reason ?? "Anulación en POS");
 
-          const itemRes = await client.query<{ sub_account_id: string; status: string }>(
-            `SELECT sub_account_id, status FROM order_items WHERE id = $1`,
-            [orderItemId],
+          const affectedSubAccountId = await voidOrderItemInTx(
+            client,
+            orderItemId,
+            reason,
+            command.branchId,
+            command.userId,
           );
-          const item = itemRes.rows[0];
-          if (!item || item.status === "voided") break;
-
-          await client.query(
-            `UPDATE order_items SET status = 'voided', void_reason = $2, voided_by = $3 WHERE id = $1`,
-            [orderItemId, reason, command.userId],
-          );
-
-          // Compensating reversal in immutable inventory_ledger
-          const origLedger = await client.query<{
-            inventory_item_id: string;
-            quantity_delta_base: string;
-            nominal_qty_base: string;
-            pour_loss_qty_base: string;
-            unit_cost_base: string;
-          }>(
-            `SELECT inventory_item_id, quantity_delta_base::text, nominal_qty_base::text,
-                    pour_loss_qty_base::text, unit_cost_base::text
-             FROM inventory_ledger
-             WHERE reference_type = 'order_item' AND reference_id = $1 AND movement_type = 'sale'`,
-            [orderItemId],
-          );
-
-          for (const row of origLedger.rows) {
-            const restoreDelta = Math.abs(Number(row.quantity_delta_base));
-            const inv = await client.query<{ current_stock_base: string }>(
-              `SELECT current_stock_base::text FROM inventory_items WHERE id = $1 FOR UPDATE`,
-              [row.inventory_item_id],
-            );
-            const nextStock =
-              Math.round((Number(inv.rows[0]?.current_stock_base ?? "0") + restoreDelta) * 1000) / 1000;
-
-            await client.query(
-              `UPDATE inventory_items SET current_stock_base = $2, updated_at = now() WHERE id = $1`,
-              [row.inventory_item_id, nextStock],
-            );
-
-            await client.query(
-              `INSERT INTO inventory_ledger (
-                 id, branch_id, inventory_item_id, movement_type,
-                 quantity_delta_base, nominal_qty_base, pour_loss_qty_base,
-                 stock_after_base, unit_cost_base, reference_type, reference_id,
-                 reason, created_by, idempotency_key
-               ) VALUES (
-                 $1, $2, $3, 'sale_void_reversal',
-                 $4, $5, $6,
-                 $7, $8, 'order_item', $9,
-                 $10, $11, $12
-               )`,
-              [
-                generateUuidV7(),
-                command.branchId,
-                row.inventory_item_id,
-                restoreDelta,
-                -Number(row.nominal_qty_base),
-                -Number(row.pour_loss_qty_base),
-                nextStock,
-                Number(row.unit_cost_base),
-                orderItemId,
-                `Reversión anulación: ${reason}`,
-                command.userId,
-                generateUuidV7(),
-              ],
-            );
+          if (affectedSubAccountId) {
+            await recalculateSubAccountTotals(client, affectedSubAccountId);
           }
-
-          await client.query(
-            `UPDATE ally_settlement_entries SET status = 'voided' WHERE order_item_id = $1`,
-            [orderItemId],
-          );
-
-          await recalculateSubAccountTotals(client, item.sub_account_id);
           break;
         }
 
