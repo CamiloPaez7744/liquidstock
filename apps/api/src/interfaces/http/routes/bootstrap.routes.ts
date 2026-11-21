@@ -88,6 +88,7 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       db.query(
         `SELECT id, branch_id AS "branchId", category_id AS "categoryId", name,
                 short_label AS "shortLabel", image_url AS "imageUrl",
+                edition_tag AS "editionTag",
                 product_kind AS "productKind", ally_id AS "allyId",
                 to_char(available_from, 'HH24:MI') AS "availableFrom",
                 to_char(available_until, 'HH24:MI') AS "availableUntil",

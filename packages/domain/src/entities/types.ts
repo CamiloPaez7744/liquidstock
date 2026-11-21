@@ -122,6 +122,8 @@ export interface MenuProduct {
   name: string;
   shortLabel?: string | null;
   imageUrl?: string | null;
+  /** Optional seasonal/special edition badge shown in POS & Stock (e.g. "Temporada", "Edición Limitada") */
+  editionTag?: string | null;
   productKind: ProductKind;
   allyId?: string | null;
   availableFrom?: string | null; // Optional "HH:MM"
@@ -208,6 +210,8 @@ export interface PromotionRule {
     fixedAmount?: number;
     fixedUnitPrice?: number;
     minQuantity?: number;
+    /** Optional filter by presentation group(s) (e.g. ["pinta"] or ["jirafa"]) across a category, product, or whole order */
+    presentationGroups?: PresentationGroup[];
   };
   priority: number;
   isStackable: boolean;
@@ -238,6 +242,7 @@ export interface OrderItemLine {
 export type SyncCommandType =
   | "OPEN_TABLE_SESSION"
   | "CREATE_SUB_ACCOUNT"
+  | "DELETE_SUB_ACCOUNT"
   | "ADD_ORDER_ITEM"
   | "VOID_ORDER_ITEM"
   | "MOVE_ORDER_ITEM"

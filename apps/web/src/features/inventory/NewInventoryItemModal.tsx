@@ -1,7 +1,22 @@
 import { useState } from "react";
-import { Beer, Cigarette, ImagePlus, PackagePlus, Plus, Trash2, Utensils, Wine, X } from "lucide-react";
+import {
+  Beer,
+  Cigarette,
+  Coffee,
+  ImagePlus,
+  Package,
+  Plus,
+  Trash2,
+  Utensils,
+  Wine,
+  X,
+} from "lucide-react";
 import type { BaseUnit, DisplayUnit, MenuCategory, PresentationGroup } from "@liquistock/domain";
 import { apiFetch } from "../../infrastructure/api/api-client.js";
+import {
+  BeerBottleIcon,
+  type ProductIconToken,
+} from "../../shared/components/ProductTypeIcon.js";
 import { haptics } from "../../shared/lib/haptics.js";
 
 interface SellablePresentationDraft {
@@ -14,19 +29,32 @@ interface SellablePresentationDraft {
   fixedLossBase: string;
 }
 
-type PresetId = "keg" | "liquor" | "cigarettes" | "snacks" | "empanadas";
+interface PurchaseFormatDraft {
+  name: string;
+  factorToBase: string;
+}
+
+type PresetId =
+  | "beer_bottle"
+  | "keg"
+  | "coffee"
+  | "liquor"
+  | "empanadas"
+  | "snacks"
+  | "cigarettes";
 
 interface PresetConfig {
   id: PresetId;
   label: string;
   example: string;
-  icon: typeof Beer;
+  icon: typeof Beer | typeof BeerBottleIcon;
+  iconToken: ProductIconToken;
   baseUnit: BaseUnit;
   isKeg: boolean;
   defaultPourLossPercent: string;
-  purchaseName: string;
-  purchaseFactor: string;
+  purchaseFormats: PurchaseFormatDraft[];
   initialStock: string;
+  initialCost: string;
   minStock: string;
   suggestedCategoryName: string;
   presentations: SellablePresentationDraft[];
@@ -34,109 +62,156 @@ interface PresetConfig {
 
 const PRESETS: PresetConfig[] = [
   {
-    id: "snacks",
-    label: "Papas / Snacks",
-    example: "Papas Margarita Pollo",
-    icon: PackagePlus,
+    id: "beer_bottle",
+    label: "Cerveza Botella",
+    example: "Club Colombia Dorada 330ml",
+    icon: BeerBottleIcon,
+    iconToken: "icon:beer_bottle",
     baseUnit: "unit",
     isKeg: false,
     defaultPourLossPercent: "0",
-    purchaseName: "Paca x12 paquetes",
-    purchaseFactor: "12",
-    initialStock: "24",
-    minStock: "6",
-    suggestedCategoryName: "Snacks & Mecato",
-    presentations: [
-      {
-        name: "Paquete",
-        presentationGroup: "comida",
-        salePrice: "4500",
-        displayUnit: "unit",
-        displayQuantity: "1",
-        pourLossPercent: "0",
-        fixedLossBase: "0",
-      },
+    purchaseFormats: [
+      { name: "Canasta x30", factorToBase: "30" },
+      { name: "Six-pack x6", factorToBase: "6" },
+      { name: "Unidad x1", factorToBase: "1" },
     ],
-  },
-  {
-    id: "empanadas",
-    label: "Empanadas / Casa",
-    example: "Empanada de Carne de la Casa",
-    icon: Utensils,
-    baseUnit: "unit",
-    isKeg: false,
-    defaultPourLossPercent: "0",
-    purchaseName: "Bandeja x20 und",
-    purchaseFactor: "20",
-    initialStock: "20",
-    minStock: "5",
-    suggestedCategoryName: "Comida de la Casa",
+    initialStock: "30",
+    initialCost: "96000",
+    minStock: "12",
+    suggestedCategoryName: "Cervezas",
     presentations: [
       {
-        name: "Unidad",
-        presentationGroup: "comida",
-        salePrice: "3500",
+        name: "Botella 330ml",
+        presentationGroup: "botella",
+        salePrice: "7000",
         displayUnit: "unit",
         displayQuantity: "1",
         pourLossPercent: "0",
         fixedLossBase: "0",
       },
       {
-        name: "Porción x3",
+        name: "Cubetazo x5",
         presentationGroup: "combo",
-        salePrice: "9500",
+        salePrice: "32000",
         displayUnit: "unit",
-        displayQuantity: "3",
+        displayQuantity: "5",
         pourLossPercent: "0",
         fixedLossBase: "0",
       },
     ],
   },
   {
-    id: "cigarettes",
-    label: "Cigarrillos",
-    example: "Marlboro Rojo",
-    icon: Cigarette,
-    baseUnit: "unit",
-    isKeg: false,
-    defaultPourLossPercent: "0",
-    purchaseName: "Cajetilla x20 und",
-    purchaseFactor: "20",
-    initialStock: "40",
-    minStock: "10",
-    suggestedCategoryName: "Cigarrillos",
+    id: "keg",
+    label: "Artesanal (Barril)",
+    example: "IPA Artesanal",
+    icon: Beer,
+    iconToken: "icon:craft_beer",
+    baseUnit: "ml",
+    isKeg: true,
+    defaultPourLossPercent: "8",
+    purchaseFormats: [
+      { name: "Barril 30L", factorToBase: "30000" },
+      { name: "Barril 20L", factorToBase: "20000" },
+      { name: "Barril 50L", factorToBase: "50000" },
+    ],
+    initialStock: "30000",
+    initialCost: "345000",
+    minStock: "4000",
+    suggestedCategoryName: "Cervezas Artesanales",
     presentations: [
       {
-        name: "Unidad (1 cig.)",
+        name: "Vaso 330ml",
+        presentationGroup: "vaso",
+        salePrice: "10000",
+        displayUnit: "ml",
+        displayQuantity: "330",
+        pourLossPercent: "8",
+        fixedLossBase: "10",
+      },
+      {
+        name: "Pinta 500ml",
+        presentationGroup: "pinta",
+        salePrice: "14000",
+        displayUnit: "ml",
+        displayQuantity: "500",
+        pourLossPercent: "8",
+        fixedLossBase: "15",
+      },
+      {
+        name: "Jirafa 3L",
+        presentationGroup: "jirafa",
+        salePrice: "72000",
+        displayUnit: "L",
+        displayQuantity: "3",
+        pourLossPercent: "3",
+        fixedLossBase: "25",
+      },
+    ],
+  },
+  {
+    id: "coffee",
+    label: "Café en Grano",
+    example: "Café Origen Huila",
+    icon: Coffee,
+    iconToken: "icon:coffee",
+    baseUnit: "g",
+    isKeg: false,
+    defaultPourLossPercent: "2",
+    purchaseFormats: [
+      { name: "Libra (500g)", factorToBase: "500" },
+      { name: "Kilo (1000g)", factorToBase: "1000" },
+      { name: "Bolsa 250g", factorToBase: "250" },
+    ],
+    initialStock: "1000",
+    initialCost: "52000",
+    minStock: "200",
+    suggestedCategoryName: "Cafetería",
+    presentations: [
+      {
+        name: "Tinto / Espresso",
         presentationGroup: "otro",
-        salePrice: "1000",
-        displayUnit: "unit",
-        displayQuantity: "1",
-        pourLossPercent: "0",
+        salePrice: "4500",
+        displayUnit: "g",
+        displayQuantity: "18",
+        pourLossPercent: "2",
         fixedLossBase: "0",
       },
       {
-        name: "Cajetilla x20",
+        name: "Americano",
         presentationGroup: "otro",
-        salePrice: "16000",
-        displayUnit: "unit",
-        displayQuantity: "20",
-        pourLossPercent: "0",
+        salePrice: "5500",
+        displayUnit: "g",
+        displayQuantity: "18",
+        pourLossPercent: "2",
+        fixedLossBase: "0",
+      },
+      {
+        name: "Espresso Doble",
+        presentationGroup: "otro",
+        salePrice: "7000",
+        displayUnit: "g",
+        displayQuantity: "36",
+        pourLossPercent: "2",
         fixedLossBase: "0",
       },
     ],
   },
   {
     id: "liquor",
-    label: "Licor (Shots/Bot.)",
+    label: "Licor / Shots",
     example: "Aguardiente Amarillo",
     icon: Wine,
+    iconToken: "icon:liquor",
     baseUnit: "ml",
     isKeg: false,
     defaultPourLossPercent: "2",
-    purchaseName: "Botella 750ml",
-    purchaseFactor: "750",
+    purchaseFormats: [
+      { name: "Botella 750ml", factorToBase: "750" },
+      { name: "Litro 1000ml", factorToBase: "1000" },
+      { name: "Caja x12 (750ml)", factorToBase: "9000" },
+    ],
     initialStock: "1500",
+    initialCost: "90000",
     minStock: "300",
     suggestedCategoryName: "Licores & Shots",
     presentations: [
@@ -170,45 +245,108 @@ const PRESETS: PresetConfig[] = [
     ],
   },
   {
-    id: "keg",
-    label: "Barril Artesanal",
-    example: "Stout Negra Artesanal",
-    icon: Beer,
-    baseUnit: "ml",
-    isKeg: true,
-    defaultPourLossPercent: "8",
-    purchaseName: "Barril 30L",
-    purchaseFactor: "30000",
-    initialStock: "30000",
-    minStock: "4000",
-    suggestedCategoryName: "Cervezas Artesanales",
+    id: "empanadas",
+    label: "Empanadas / Casa",
+    example: "Empanada de Carne",
+    icon: Utensils,
+    iconToken: "icon:food",
+    baseUnit: "unit",
+    isKeg: false,
+    defaultPourLossPercent: "0",
+    purchaseFormats: [
+      { name: "Bandeja x20", factorToBase: "20" },
+      { name: "Unidad x1", factorToBase: "1" },
+    ],
+    initialStock: "20",
+    initialCost: "32000",
+    minStock: "5",
+    suggestedCategoryName: "Comida de la Casa",
     presentations: [
       {
-        name: "Vaso 330ml",
-        presentationGroup: "vaso",
-        salePrice: "10000",
-        displayUnit: "ml",
-        displayQuantity: "330",
-        pourLossPercent: "8",
-        fixedLossBase: "10",
+        name: "Unidad",
+        presentationGroup: "comida",
+        salePrice: "3500",
+        displayUnit: "unit",
+        displayQuantity: "1",
+        pourLossPercent: "0",
+        fixedLossBase: "0",
       },
       {
-        name: "Pinta 500ml",
-        presentationGroup: "pinta",
-        salePrice: "14000",
-        displayUnit: "ml",
-        displayQuantity: "500",
-        pourLossPercent: "8",
-        fixedLossBase: "15",
-      },
-      {
-        name: "Jirafa 3L",
-        presentationGroup: "jirafa",
-        salePrice: "72000",
-        displayUnit: "L",
+        name: "Porción x3",
+        presentationGroup: "combo",
+        salePrice: "9500",
+        displayUnit: "unit",
         displayQuantity: "3",
-        pourLossPercent: "3",
-        fixedLossBase: "25",
+        pourLossPercent: "0",
+        fixedLossBase: "0",
+      },
+    ],
+  },
+  {
+    id: "snacks",
+    label: "Papas / Snacks",
+    example: "Papas Margarita Pollo",
+    icon: Package,
+    iconToken: "icon:snacks",
+    baseUnit: "unit",
+    isKeg: false,
+    defaultPourLossPercent: "0",
+    purchaseFormats: [
+      { name: "Paca x12", factorToBase: "12" },
+      { name: "Unidad x1", factorToBase: "1" },
+    ],
+    initialStock: "24",
+    initialCost: "48000",
+    minStock: "6",
+    suggestedCategoryName: "Snacks & Mecato",
+    presentations: [
+      {
+        name: "Paquete",
+        presentationGroup: "comida",
+        salePrice: "4500",
+        displayUnit: "unit",
+        displayQuantity: "1",
+        pourLossPercent: "0",
+        fixedLossBase: "0",
+      },
+    ],
+  },
+  {
+    id: "cigarettes",
+    label: "Cigarrillos",
+    example: "Marlboro Rojo",
+    icon: Cigarette,
+    iconToken: "icon:cigarettes",
+    baseUnit: "unit",
+    isKeg: false,
+    defaultPourLossPercent: "0",
+    purchaseFormats: [
+      { name: "Cajetilla x20", factorToBase: "20" },
+      { name: "Cartón x200", factorToBase: "200" },
+      { name: "Unidad x1", factorToBase: "1" },
+    ],
+    initialStock: "40",
+    initialCost: "24000",
+    minStock: "10",
+    suggestedCategoryName: "Cigarrillos",
+    presentations: [
+      {
+        name: "Unidad (1 cig.)",
+        presentationGroup: "otro",
+        salePrice: "1000",
+        displayUnit: "unit",
+        displayQuantity: "1",
+        pourLossPercent: "0",
+        fixedLossBase: "0",
+      },
+      {
+        name: "Cajetilla x20",
+        presentationGroup: "otro",
+        salePrice: "16000",
+        displayUnit: "unit",
+        displayQuantity: "20",
+        pourLossPercent: "0",
+        fixedLossBase: "0",
       },
     ],
   },
@@ -218,7 +356,7 @@ interface NewInventoryItemModalProps {
   branchId: string;
   userId: string;
   categories: MenuCategory[];
-  onCreated: () => Promise<void>;
+  onCreated: (createdItemId?: string) => Promise<void>;
   onClose: () => void;
 }
 
@@ -229,27 +367,38 @@ export function NewInventoryItemModal({
   onCreated,
   onClose,
 }: NewInventoryItemModalProps) {
-  const [presetId, setPresetId] = useState<PresetId>("snacks");
+  const firstPreset = PRESETS[0]!;
+  const initialCat = categories.find(
+    (c) => c.name.toLowerCase() === firstPreset.suggestedCategoryName.toLowerCase(),
+  );
+
+  const [presetId, setPresetId] = useState<PresetId>(firstPreset.id);
   const [name, setName] = useState("");
-  const [baseUnit, setBaseUnit] = useState<BaseUnit>("unit");
-  const [isKeg, setIsKeg] = useState(false);
-  const [defaultPourLossPct, setDefaultPourLossPct] = useState("0");
-  const [purchaseName, setPurchaseName] = useState("Paca x12 paquetes");
-  const [purchaseFactor, setPurchaseFactor] = useState("12");
-  const [initialStock, setInitialStock] = useState("24");
-  const [initialCost, setInitialCost] = useState("48000");
-  const [minStock, setMinStock] = useState("6");
+  const [baseUnit, setBaseUnit] = useState<BaseUnit>(firstPreset.baseUnit);
+  const [isKeg, setIsKeg] = useState(firstPreset.isKeg);
+  const [defaultPourLossPct, setDefaultPourLossPct] = useState(firstPreset.defaultPourLossPercent);
+  const [purchaseFormats, setPurchaseFormats] = useState<PurchaseFormatDraft[]>(
+    firstPreset.purchaseFormats.map((f) => ({ ...f })),
+  );
+  const [initialStock, setInitialStock] = useState(firstPreset.initialStock);
+  const [initialCost, setInitialCost] = useState(firstPreset.initialCost);
+  const [minStock, setMinStock] = useState(firstPreset.minStock);
 
   const [publishToMenu, setPublishToMenu] = useState(true);
-  const [categoryId, setCategoryId] = useState<string>("__new__");
-  const [newCategoryName, setNewCategoryName] = useState("Snacks & Mecato");
+  const [categoryId, setCategoryId] = useState<string>(initialCat?.id ?? "__new__");
+  const [newCategoryName, setNewCategoryName] = useState(
+    initialCat ? "" : firstPreset.suggestedCategoryName,
+  );
+  const [editionTag, setEditionTag] = useState<string>("");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [presentations, setPresentations] = useState<SellablePresentationDraft[]>(
-    PRESETS[0]!.presentations,
+    firstPreset.presentations.map((p) => ({ ...p })),
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const currentPreset = PRESETS.find((p) => p.id === presetId) ?? firstPreset;
 
   const applyPreset = (p: PresetConfig) => {
     haptics.tap();
@@ -257,9 +406,9 @@ export function NewInventoryItemModal({
     setBaseUnit(p.baseUnit);
     setIsKeg(p.isKeg);
     setDefaultPourLossPct(p.defaultPourLossPercent);
-    setPurchaseName(p.purchaseName);
-    setPurchaseFactor(p.purchaseFactor);
+    setPurchaseFormats(p.purchaseFormats.map((f) => ({ ...f })));
     setInitialStock(p.initialStock);
+    setInitialCost(p.initialCost);
     setMinStock(p.minStock);
     setPresentations(p.presentations.map((x) => ({ ...x })));
 
@@ -298,11 +447,11 @@ export function NewInventoryItemModal({
     setPresentations((prev) => [
       ...prev,
       {
-        name: baseUnit === "ml" ? "Presentación nueva" : "Unidad",
+        name: baseUnit === "ml" ? "Presentación nueva" : baseUnit === "g" ? "Taza / Porción" : "Unidad",
         presentationGroup: baseUnit === "ml" ? "trago" : "otro",
         salePrice: "5000",
         displayUnit: baseUnit,
-        displayQuantity: "1",
+        displayQuantity: baseUnit === "g" ? "18" : "1",
         pourLossPercent: defaultPourLossPct,
         fixedLossBase: "0",
       },
@@ -320,9 +469,18 @@ export function NewInventoryItemModal({
       return;
     }
 
+    const validFormats = purchaseFormats
+      .filter((f) => f.name.trim() && Number(f.factorToBase) > 0)
+      .map((f, idx) => ({
+        name: f.name.trim(),
+        factorToBase: Number(f.factorToBase),
+        lastPurchaseCost: idx === 0 ? Number(initialCost) || 0 : null,
+        isDefault: idx === 0,
+      }));
+
     setSaving(true);
     try {
-      await apiFetch(`/api/v1/branches/${branchId}/inventory/items`, {
+      const created = await apiFetch<{ id: string }>(`/api/v1/branches/${branchId}/inventory/items`, {
         method: "POST",
         body: JSON.stringify({
           name: name.trim(),
@@ -333,19 +491,14 @@ export function NewInventoryItemModal({
           defaultPourLossPercent: Number(defaultPourLossPct) || 0,
           isKeg,
           userId,
-          purchasePresentation: purchaseName.trim()
-            ? {
-                name: purchaseName.trim(),
-                factorToBase: Math.max(0.001, Number(purchaseFactor) || 1),
-                lastPurchaseCost: Number(initialCost) || 0,
-              }
-            : undefined,
+          purchasePresentations: validFormats.length > 0 ? validFormats : undefined,
           publishToMenu: publishToMenu
             ? {
                 categoryId: categoryId !== "__new__" ? categoryId : undefined,
                 newCategoryName: categoryId === "__new__" ? newCategoryName.trim() : undefined,
                 productName: name.trim(),
-                imageUrl,
+                imageUrl: imageUrl ?? currentPreset.iconToken,
+                editionTag: editionTag.trim() || null,
                 presentations: presentations.map((p) => ({
                   name: p.name.trim() || "Estándar",
                   presentationGroup: p.presentationGroup,
@@ -360,7 +513,7 @@ export function NewInventoryItemModal({
         }),
       });
       haptics.success();
-      await onCreated();
+      await onCreated(created.id);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "No se pudo guardar el insumo.");
@@ -369,19 +522,15 @@ export function NewInventoryItemModal({
     }
   };
 
-  const currentPreset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0]!;
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 backdrop-blur-sm md:p-5">
       <div className="material-thick flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-3xl border border-white/10">
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
           <div>
-            <h2 className="font-display text-lg font-bold">
-              Nuevo Insumo / Producto (Licores, Papas, Cigarrillos, Empanadas...)
-            </h2>
+            <h2 className="font-display text-lg font-bold">Nuevo Insumo / Producto</h2>
             <p className="text-xs text-muted-foreground">
-              Elige una plantilla rápida y en 1 paso queda en tu inventario y listo para vender en el
-              POS.
+              Elige un preset y define múltiples formatos de compra (unidad, six-pack, canasta,
+              libra, barril)
             </p>
           </div>
           <button
@@ -394,12 +543,12 @@ export function NewInventoryItemModal({
         </div>
 
         <div className="flex-1 space-y-5 overflow-y-auto p-5">
-          {/* 1. Plantillas de 1 toque */}
+          {/* 1. Plantillas con íconos vectoriales coherentes */}
           <div>
             <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              1. ¿Qué tipo de producto vas a agregar?
+              1. Tipo de producto
             </p>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
               {PRESETS.map((p) => {
                 const Icon = p.icon;
                 const active = p.id === presetId;
@@ -408,24 +557,24 @@ export function NewInventoryItemModal({
                     key={p.id}
                     type="button"
                     onClick={() => applyPreset(p)}
-                    className={`press-response flex flex-col items-center gap-1.5 rounded-2xl border p-3 text-center text-xs font-bold ${
+                    className={`press-response flex flex-col items-center justify-center gap-1.5 rounded-2xl border p-2.5 text-center text-[11px] font-bold ${
                       active
                         ? "border-primary bg-primary/20 text-primary"
                         : "border-white/10 bg-secondary/60 text-muted-foreground"
                     }`}
                   >
                     <Icon className="h-5 w-5" />
-                    <span>{p.label}</span>
+                    <span className="leading-tight">{p.label}</span>
                   </button>
                 );
               })}
             </div>
           </div>
 
-          {/* 2. Datos de Inventario */}
+          {/* 2. Datos de Inventario y Múltiples Formatos de Compra */}
           <div className="solid-card space-y-3 rounded-2xl p-4">
             <p className="text-xs font-semibold uppercase tracking-wider text-primary">
-              2. Datos de Inventario y Compra
+              2. Datos de Inventario y Formatos de Compra
             </p>
             <div className="grid gap-3 sm:grid-cols-3">
               <div className="sm:col-span-2">
@@ -445,14 +594,14 @@ export function NewInventoryItemModal({
                   onChange={(e) => setBaseUnit(e.target.value as BaseUnit)}
                   className="w-full rounded-xl border border-white/15 bg-background px-3 py-2.5 text-sm"
                 >
-                  <option value="unit">Unidades (papas, empanadas, cigarrillos)</option>
-                  <option value="ml">Mililitros (barriles, licores)</option>
-                  <option value="g">Gramos (insumos sólidos)</option>
+                  <option value="unit">Unidades (botellas, snacks, empanadas)</option>
+                  <option value="ml">Mililitros (barriles, licores, leche)</option>
+                  <option value="g">Gramos (café en grano, sólidos)</option>
                 </select>
               </div>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-4">
+            <div className={`grid gap-3 ${baseUnit === "ml" || baseUnit === "g" ? "sm:grid-cols-4" : "sm:grid-cols-3"}`}>
               <div>
                 <label className="mb-1 block text-xs text-muted-foreground">
                   Stock inicial ({baseUnit})
@@ -479,32 +628,6 @@ export function NewInventoryItemModal({
               </div>
               <div>
                 <label className="mb-1 block text-xs text-muted-foreground">
-                  Presentación compra
-                </label>
-                <input
-                  type="text"
-                  value={purchaseName}
-                  onChange={(e) => setPurchaseName(e.target.value)}
-                  className="w-full rounded-xl border border-white/15 bg-background px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs text-muted-foreground">
-                  Trae ({baseUnit})
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  value={purchaseFactor}
-                  onChange={(e) => setPurchaseFactor(e.target.value)}
-                  className="w-full rounded-xl border border-white/15 bg-background px-3 py-2 text-sm tabular-nums"
-                />
-              </div>
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div>
-                <label className="mb-1 block text-xs text-muted-foreground">
                   Costo compra inicial (COP)
                 </label>
                 <input
@@ -515,31 +638,100 @@ export function NewInventoryItemModal({
                   className="w-full rounded-xl border border-white/15 bg-background px-3 py-2 text-sm tabular-nums"
                 />
               </div>
-              <div>
-                <label className="mb-1 block text-xs text-muted-foreground">
-                  % Merma / Espuma base
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  max={50}
-                  value={defaultPourLossPct}
-                  onChange={(e) => setDefaultPourLossPct(e.target.value)}
-                  className="w-full rounded-xl border border-white/15 bg-background px-3 py-2 text-sm tabular-nums"
-                />
-              </div>
-              <div className="flex items-end">
-                <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-background/60 px-3 py-2 text-xs font-semibold">
+              {(baseUnit === "ml" || baseUnit === "g") && (
+                <div>
+                  <label className="mb-1 block text-xs text-muted-foreground">
+                    {baseUnit === "ml" ? "% Merma / Espuma (opcional)" : "% Merma molienda (opcional)"}
+                  </label>
                   <input
-                    type="checkbox"
-                    checked={isKeg}
-                    onChange={(e) => setIsKeg(e.target.checked)}
-                    className="h-4 w-4 accent-primary"
+                    type="number"
+                    min={0}
+                    max={50}
+                    value={defaultPourLossPct}
+                    onChange={(e) => setDefaultPourLossPct(e.target.value)}
+                    className="w-full rounded-xl border border-white/15 bg-background px-3 py-2 text-sm tabular-nums"
                   />
-                  Es barril de cerveza
-                </label>
+                </div>
+              )}
+            </div>
+
+            {/* Formatos de compra flexibles (Unidad, Six-pack, Canasta x30, Libra, Kilo...) */}
+            <div className="space-y-2 rounded-xl border border-white/10 bg-background/50 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  Formatos en los que compras este insumo (puedes tener varios)
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPurchaseFormats((prev) => [...prev, { name: "", factorToBase: "1" }])
+                  }
+                  className="press-response flex items-center gap-1 rounded-lg bg-secondary px-2.5 py-1 text-[11px] font-bold text-primary"
+                >
+                  <Plus className="h-3 w-3" />
+                  Agregar formato
+                </button>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {purchaseFormats.map((pf, idx) => (
+                  <div
+                    key={idx}
+                    className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-card p-1.5"
+                  >
+                    <input
+                      type="text"
+                      placeholder="Ej. Canasta x30, Libra"
+                      value={pf.name}
+                      onChange={(e) =>
+                        setPurchaseFormats((prev) =>
+                          prev.map((x, i) => (i === idx ? { ...x, name: e.target.value } : x)),
+                        )
+                      }
+                      className="min-w-0 flex-1 rounded-md bg-background px-2 py-1 text-xs font-semibold"
+                    />
+                    <span className="text-[10px] text-muted-foreground">=</span>
+                    <input
+                      type="number"
+                      min={0.1}
+                      step="any"
+                      value={pf.factorToBase}
+                      onChange={(e) =>
+                        setPurchaseFormats((prev) =>
+                          prev.map((x, i) =>
+                            i === idx ? { ...x, factorToBase: e.target.value } : x,
+                          ),
+                        )
+                      }
+                      className="w-16 rounded-md bg-background px-2 py-1 text-right text-xs tabular-nums"
+                    />
+                    <span className="pr-1 text-[10px] text-muted-foreground">{baseUnit}</span>
+                    {purchaseFormats.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPurchaseFormats((prev) => prev.filter((_, i) => i !== idx))
+                        }
+                        className="rounded-md bg-destructive/15 p-1 text-destructive"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
+
+            {baseUnit === "ml" && (
+              <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-background/60 px-3 py-2 text-xs font-semibold">
+                <input
+                  type="checkbox"
+                  checked={isKeg}
+                  onChange={(e) => setIsKeg(e.target.checked)}
+                  className="h-4 w-4 accent-primary"
+                />
+                Es barril de cerveza artesanal (calcula pintas restantes y espuma)
+              </label>
+            )}
           </div>
 
           {/* 3. Publicar directo en Menú del POS */}
@@ -558,7 +750,7 @@ export function NewInventoryItemModal({
               {publishToMenu && (
                 <label className="press-response flex cursor-pointer items-center gap-1.5 rounded-xl bg-secondary px-3 py-1.5 text-xs font-semibold text-primary">
                   <ImagePlus className="h-4 w-4" />
-                  {uploading ? "Subiendo..." : imageUrl ? "Foto cargada ✓" : "Subir foto"}
+                  {uploading ? "Subiendo..." : imageUrl ? "Foto cargada ✓" : "Subir foto (opcional)"}
                   <input
                     type="file"
                     accept="image/*"
@@ -600,7 +792,7 @@ export function NewInventoryItemModal({
                       </label>
                       <input
                         type="text"
-                        placeholder="Ej. Snacks & Mecato, Cigarrillos..."
+                        placeholder="Ej. Cervezas, Cafetería, Snacks..."
                         value={newCategoryName}
                         onChange={(e) => setNewCategoryName(e.target.value)}
                         className="w-full rounded-xl border border-primary/40 bg-background px-3 py-2 text-sm"
@@ -609,11 +801,57 @@ export function NewInventoryItemModal({
                   )}
                 </div>
 
+                {/* Etiqueta especial en el POS (Temporada / Edición Limitada / Nueva) */}
+                <div className="space-y-2 rounded-xl border border-white/10 bg-background/50 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      Etiqueta destacada en el POS (opcional)
+                    </span>
+                    {editionTag.trim() && (
+                      <span className="rounded-full bg-accent/20 px-2 py-0.5 text-[11px] font-bold text-accent">
+                        {editionTag.trim()}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {["", "Temporada", "Edición Limitada", "Nueva", "Recomendada"].map((tagOpt) => {
+                      const active = editionTag.trim() === tagOpt;
+                      return (
+                        <button
+                          key={tagOpt || "none"}
+                          type="button"
+                          onClick={() => {
+                            haptics.tap();
+                            setEditionTag(tagOpt);
+                          }}
+                          className={`press-response rounded-lg border px-2.5 py-1 text-xs font-bold transition ${
+                            active
+                              ? tagOpt
+                                ? "border-accent bg-accent/20 text-accent"
+                                : "border-primary bg-primary/15 text-primary"
+                              : "border-white/10 bg-secondary/60 text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          {tagOpt || "Sin etiqueta"}
+                        </button>
+                      );
+                    })}
+                    <input
+                      type="text"
+                      maxLength={24}
+                      placeholder="Otra (ej. Oktoberfest)"
+                      value={editionTag}
+                      onChange={(e) => setEditionTag(e.target.value)}
+                      className="min-w-36 flex-1 rounded-lg border border-white/15 bg-background px-2.5 py-1 text-xs"
+                    />
+                  </div>
+                </div>
+
                 {/* Presentaciones vendibles */}
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-muted-foreground">
-                      ¿Cómo lo vendes y a qué precio? (puedes poner varias presentaciones)
+                      ¿Cómo lo vendes y cuánto descuenta?
                     </span>
                     <button
                       type="button"
@@ -632,7 +870,7 @@ export function NewInventoryItemModal({
                     >
                       <input
                         type="text"
-                        placeholder="Ej. Unidad, Cajetilla, Shot 1oz"
+                        placeholder="Ej. Botella 330ml, Tinto, Shot"
                         value={pr.name}
                         onChange={(e) => updatePres(idx, { name: e.target.value })}
                         className="rounded-lg border border-white/10 bg-card px-2.5 py-1.5 text-xs font-semibold sm:col-span-4"
@@ -736,4 +974,3 @@ export function NewInventoryItemModal({
     </div>
   );
 }
-

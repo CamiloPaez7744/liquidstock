@@ -350,26 +350,32 @@ export function NewComboModal({
                       </select>
 
                       <div className="flex items-center gap-1 sm:col-span-3">
-                        <input
-                          type="number"
-                          title="% espuma"
-                          value={ing.pourLossPercent}
-                          onChange={(e) =>
-                            updateIngredient(idx, { pourLossPercent: e.target.value })
-                          }
-                          className="w-14 rounded-lg border border-white/10 bg-card px-1.5 py-1.5 text-xs tabular-nums"
-                        />
-                        <span className="text-[10px] text-muted-foreground">% esp.</span>
-                        <input
-                          type="number"
-                          title="Purga fija ml"
-                          value={ing.fixedLossBase}
-                          onChange={(e) =>
-                            updateIngredient(idx, { fixedLossBase: e.target.value })
-                          }
-                          className="w-14 rounded-lg border border-white/10 bg-card px-1.5 py-1.5 text-xs tabular-nums"
-                        />
-                        <span className="text-[10px] text-muted-foreground">ml</span>
+                        {inv?.baseUnit === "ml" ? (
+                          <>
+                            <input
+                              type="number"
+                              title="% espuma"
+                              value={ing.pourLossPercent}
+                              onChange={(e) =>
+                                updateIngredient(idx, { pourLossPercent: e.target.value })
+                              }
+                              className="w-14 rounded-lg border border-white/10 bg-card px-1.5 py-1.5 text-xs tabular-nums"
+                            />
+                            <span className="text-[10px] text-muted-foreground">% esp.</span>
+                            <input
+                              type="number"
+                              title="Purga fija ml"
+                              value={ing.fixedLossBase}
+                              onChange={(e) =>
+                                updateIngredient(idx, { fixedLossBase: e.target.value })
+                              }
+                              className="w-14 rounded-lg border border-white/10 bg-card px-1.5 py-1.5 text-xs tabular-nums"
+                            />
+                            <span className="text-[10px] text-muted-foreground">ml</span>
+                          </>
+                        ) : (
+                          <span className="text-[11px] text-muted-foreground">Sin merma</span>
+                        )}
                       </div>
 
                       <div className="flex justify-end sm:col-span-1">
