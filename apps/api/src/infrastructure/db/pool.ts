@@ -20,7 +20,17 @@ export interface DbClient {
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const databaseUrl = process.env.DATABASE_URL ?? "pglite://./data/pgdata";
+
+function sanitizeDatabaseUrl(raw?: string): string {
+  const cleaned = (raw ?? "")
+    .trim()
+    .replace(/^psql\s+/i, "")
+    .replace(/^['"]+|['"]+$/g, "")
+    .trim();
+  return cleaned || "pglite://./data/pgdata";
+}
+
+const databaseUrl = sanitizeDatabaseUrl(process.env.DATABASE_URL);
 const isPglite = databaseUrl.startsWith("pglite://");
 
 let pgPool: pg.Pool | null = null;
@@ -56,14 +66,47 @@ function shouldUseSsl(url: string): boolean {
   );
 }
 
+function buildPgConnectionConfig(rawUrl: string): {
+  connectionString: string;
+  useSsl: boolean;
+  safeSummary: string;
+} {
+  const useSsl = shouldUseSsl(rawUrl);
+  try {
+    const parsed = new URL(rawUrl);
+    // Neon's default connection string includes `channel_binding=require`,
+    // which can stall TLS/SCRAM negotiation in node-postgres (`pg`).
+    parsed.searchParams.delete("channel_binding");
+    // Avoid pg-connection-string overriding our explicit `ssl` Pool option.
+    if (useSsl) {
+      parsed.searchParams.delete("sslmode");
+    }
+    const safeSummary = `host=${parsed.hostname} port=${parsed.port || "5432"} db=${parsed.pathname.replace(/^\//, "") || "postgres"} ssl=${useSsl}`;
+    return {
+      connectionString: parsed.toString(),
+      useSsl,
+      safeSummary,
+    };
+  } catch {
+    return {
+      connectionString: rawUrl,
+      useSsl,
+      safeSummary: `ssl=${useSsl} (unparsed connection string)`,
+    };
+  }
+}
+
 function getPgPool(): pg.Pool {
   if (!pgPool) {
+    const cfg = buildPgConnectionConfig(databaseUrl);
+    console.log(`[db] Initializing PostgreSQL pool (${cfg.safeSummary})`);
     pgPool = new Pool({
-      connectionString: databaseUrl,
+      connectionString: cfg.connectionString,
       max: Number(process.env.PG_POOL_MAX ?? 10),
       idleTimeoutMillis: 20_000,
-      connectionTimeoutMillis: 15_000,
-      ssl: shouldUseSsl(databaseUrl) ? { rejectUnauthorized: false } : undefined,
+      connectionTimeoutMillis: 30_000,
+      keepAlive: true,
+      ssl: cfg.useSsl ? { rejectUnauthorized: false } : undefined,
     });
     // Prevent unhandled 'error' crashes when serverless Postgres (e.g. Neon) closes idle connections
     pgPool.on("error", (err) => {

@@ -7,10 +7,28 @@ import { closeDb, db, dbEngineLabel, withTransaction } from "./pool.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const migrationsDir = path.resolve(__dirname, "../../../migrations");
 
+async function waitForDatabase(maxAttempts = 3): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await db.query("SELECT 1");
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[migrate] DB wakeup attempt ${attempt}/${maxAttempts} failed (${message}). Retrying in 3s...`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+  }
+}
+
 async function runMigrations() {
   const files = (await fs.readdir(migrationsDir))
     .filter((f) => f.endsWith(".sql"))
     .sort();
+
+  await waitForDatabase();
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
