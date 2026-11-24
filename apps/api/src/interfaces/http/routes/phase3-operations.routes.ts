@@ -1,7 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { generateUuidV7 } from "@liquistock/domain";
-import { requireBranchRole, requireOrgAdmin } from "../../../infrastructure/auth/auth-guard.js";
+import {
+  requireBranchModulePermission,
+  requireOrgAdmin,
+} from "../../../infrastructure/auth/auth-guard.js";
 import { db, withTransaction } from "../../../infrastructure/db/pool.js";
 import { branchHub } from "../../../infrastructure/realtime/branch-hub.js";
 
@@ -31,7 +34,7 @@ export async function registerPhase3OperationsRoutes(app: FastifyInstance) {
   // ============================================================================
   app.post("/api/v1/branches/:branchId/customers/:customerId/repayments", async (request, reply) => {
     const { branchId, customerId } = request.params as { branchId: string; customerId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin", "cashier"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "cash", "edit");
     if (!auth) return;
 
     const parsed = repaymentSchema.safeParse(request.body);
@@ -182,7 +185,7 @@ export async function registerPhase3OperationsRoutes(app: FastifyInstance) {
 
   app.get("/api/v1/branches/:branchId/customers/:customerId/ledger", async (request, reply) => {
     const { branchId, customerId } = request.params as { branchId: string; customerId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin", "cashier"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "cash", "view");
     if (!auth) return;
 
     const res = await db.query(
@@ -209,7 +212,7 @@ export async function registerPhase3OperationsRoutes(app: FastifyInstance) {
   // ============================================================================
   app.get("/api/v1/branches/:branchId/allies/settlements", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin", "cashier"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "cash", "view");
     if (!auth) return;
 
     const [pendingItemsRes, historyRes] = await Promise.all([
@@ -314,7 +317,7 @@ export async function registerPhase3OperationsRoutes(app: FastifyInstance) {
   // ============================================================================
   app.get("/api/v1/branches/:branchId/shifts/history", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin", "cashier"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "cash", "view");
     if (!auth) return;
 
     const res = await db.query(
@@ -349,7 +352,7 @@ export async function registerPhase3OperationsRoutes(app: FastifyInstance) {
   // ============================================================================
   app.get("/api/v1/branches/:branchId/alerts-audit", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "kpis", "view");
     if (!auth) return;
 
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();

@@ -1,0 +1,32 @@
+# Render Blueprint for LiquiStock API (Fastify + WebSockets + Neon PostgreSQL)
+# Import this repository in Render or use these exact commands/variables manually.
+services:
+  - type: web
+    name: liquistock-api
+    runtime: node
+    plan: free
+    region: ohio
+    branch: main
+    healthCheckPath: /health
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm --filter @liquistock/api db:migrate
+    startCommand: pnpm --filter @liquistock/api start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        sync: false
+      # Optional persistent image uploads on Render (Free tier: 25 GB on Cloudinary)
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: liquistock

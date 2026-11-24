@@ -4,6 +4,7 @@ import {
   Check,
   CheckCircle2,
   CreditCard,
+  Eye,
   Globe,
   ImagePlus,
   KeyRound,
@@ -43,6 +44,8 @@ export function UsersBranchesView({
   memberships,
   organizations,
   currentUserId,
+  canEdit = true,
+  isAdmin = true,
   onProfileOrBranchesChanged,
 }: {
   store: ReturnType<typeof useLiquiStock>;
@@ -50,6 +53,8 @@ export function UsersBranchesView({
   memberships: StoredBranchMembership[];
   organizations: OrganizationProfile[];
   currentUserId: string;
+  canEdit?: boolean;
+  isAdmin?: boolean;
   onProfileOrBranchesChanged: () => Promise<void>;
 }) {
   const activeMembership =
@@ -140,13 +145,32 @@ export function UsersBranchesView({
   };
 
   const loadUsers = useCallback(async () => {
+    if (!isAdmin) {
+      setUsers(
+        store.users.map((u) => ({
+          id: u.id,
+          fullName: u.fullName,
+          email: "",
+          hasPin: true,
+          isActive: true,
+          assignments: [
+            {
+              branchId,
+              branchName: store.branch?.name ?? "Sede actual",
+              role: u.role,
+            },
+          ],
+        })),
+      );
+      return;
+    }
     try {
       const res = await apiFetch<{ users: ManagedUser[] }>("/api/v1/users");
       setUsers(res.users);
     } catch {
       // Offline
     }
-  }, []);
+  }, [isAdmin, store.users, branchId, store.branch?.name]);
 
   useEffect(() => {
     void loadUsers();
@@ -471,6 +495,16 @@ export function UsersBranchesView({
 
   return (
     <div className="space-y-6">
+      {!canEdit && (
+        <div className="flex items-center gap-2 rounded-2xl border border-warning/35 bg-warning/10 px-4 py-3 text-xs font-semibold text-warning">
+          <Eye className="h-4 w-4 shrink-0" />
+          <span>
+            Modo solo vista: puedes consultar el perfil del bar, mesas, medios de pago y equipo sin
+            realizar modificaciones.
+          </span>
+        </div>
+      )}
+
       {notice && (
         <div
           className={`flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold ${
@@ -484,6 +518,7 @@ export function UsersBranchesView({
         </div>
       )}
 
+      <fieldset disabled={!canEdit} className="space-y-6">
       {/* 1. IDENTIDAD DEL BAR: Logo, Razón Social, NIT y Redes Sociales */}
       {activeOrg && (
         <section className="solid-card space-y-4 rounded-2xl border-primary/25 p-5">
@@ -1309,6 +1344,7 @@ export function UsersBranchesView({
           </div>
         </section>
       </div>
+      </fieldset>
     </div>
   );
 }

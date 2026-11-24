@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Clock,
   CreditCard,
+  Eye,
   Handshake,
   Plus,
   Search,
@@ -43,11 +44,15 @@ type StoreType = ReturnType<typeof useLiquiStock>;
 export function TablesPosView({
   store,
   isAdmin,
+  canEdit = true,
+  canEditInventory,
   barBranding,
   onGoToInventory,
 }: {
   store: StoreType;
   isAdmin: boolean;
+  canEdit?: boolean;
+  canEditInventory?: boolean;
   barBranding?: ReceiptBarBranding;
   onGoToInventory?: () => void;
 }) {
@@ -280,6 +285,15 @@ export function TablesPosView({
     quantity = 1,
     forcedPromotionRuleId?: string | null,
   ) => {
+    if (!canEdit) {
+      haptics.blocked();
+      toast({
+        kind: "warning",
+        title: "Modo solo vista",
+        description: "Tu rol puede consultar el POS pero no agregar pedidos.",
+      });
+      return;
+    }
     haptics.tap();
     let targetSubId = currentSubAccount?.id;
     if (!targetSubId) {
@@ -297,6 +311,7 @@ export function TablesPosView({
   };
 
   const handleSplitAccount = async () => {
+    if (!canEdit) return;
     haptics.tap();
     if (!activeSession) {
       const opened = await store.openTableSession(selectedTableId, "Cuenta 1");
@@ -482,7 +497,7 @@ export function TablesPosView({
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {store.featureFlags.enableSplitAccounts && (
+            {canEdit && store.featureFlags.enableSplitAccounts && (
               <button
                 type="button"
                 onClick={handleSplitAccount}
@@ -514,7 +529,7 @@ export function TablesPosView({
                 return (
                   <div
                     key={sa.id}
-                    draggable={!isMoveTarget}
+                    draggable={canEdit && !isMoveTarget}
                     onDragStart={(e) => {
                       e.dataTransfer.setData("text/plain", sa.id);
                       e.dataTransfer.effectAllowed = "move";
@@ -548,7 +563,7 @@ export function TablesPosView({
                     >
                       {isMoveTarget ? `→ Mover a ${sa.label}` : sa.label}
                     </button>
-                    {!isMoveTarget && (
+                    {canEdit && !isMoveTarget && (
                       <button
                         type="button"
                         title={`Eliminar ${sa.label} (o arrastra a la papelera)`}
@@ -657,36 +672,38 @@ export function TablesPosView({
                   </div>
                 </div>
 
-                <div className="mt-2.5 flex items-center justify-end gap-2">
-                  {sessionSubAccounts.length > 1 && (
+                {canEdit && (
+                  <div className="mt-2.5 flex items-center justify-end gap-2">
+                    {sessionSubAccounts.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          haptics.tap();
+                          setMovingItemId(isMovingThis ? null : item.id);
+                        }}
+                        className={`press-response flex min-h-9 items-center gap-1 rounded-lg px-3 text-xs font-semibold ${
+                          isMovingThis
+                            ? "bg-warning text-primary-foreground"
+                            : "bg-secondary text-muted-foreground"
+                        }`}
+                      >
+                        <ArrowRightLeft className="h-3.5 w-3.5" />
+                        {isMovingThis ? "Elige cuenta arriba" : "Mover"}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
                         haptics.tap();
-                        setMovingItemId(isMovingThis ? null : item.id);
+                        void store.voidOrderItem(item.id, "Retirado en comanda");
                       }}
-                      className={`press-response flex min-h-9 items-center gap-1 rounded-lg px-3 text-xs font-semibold ${
-                        isMovingThis
-                          ? "bg-warning text-primary-foreground"
-                          : "bg-secondary text-muted-foreground"
-                      }`}
+                      className="press-response flex min-h-9 items-center gap-1 rounded-lg bg-destructive/15 px-3 text-xs font-semibold text-destructive"
                     >
-                      <ArrowRightLeft className="h-3.5 w-3.5" />
-                      {isMovingThis ? "Elige cuenta arriba" : "Mover"}
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Anular
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      haptics.tap();
-                      void store.voidOrderItem(item.id, "Retirado en comanda");
-                    }}
-                    className="press-response flex min-h-9 items-center gap-1 rounded-lg bg-destructive/15 px-3 text-xs font-semibold text-destructive"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    Anular
-                  </button>
-                </div>
+                  </div>
+                )}
               </div>
             );
           })
@@ -715,8 +732,9 @@ export function TablesPosView({
 
         <button
           type="button"
-          disabled={!currentSubAccount || currentSubItems.length === 0}
+          disabled={!canEdit || !currentSubAccount || currentSubItems.length === 0}
           onClick={() => {
+            if (!canEdit) return;
             haptics.tap();
             setShowMobileOrderSheet(false);
             setShowCheckout(true);
@@ -724,7 +742,9 @@ export function TablesPosView({
           className="press-response flex min-h-14 w-full items-center justify-center gap-2 rounded-2xl bg-primary text-base font-bold text-primary-foreground disabled:opacity-40"
         >
           <CreditCard className="h-5 w-5" />
-          Cobrar / Fiar · {formatCOP(currentPendingBalance)}
+          {canEdit
+            ? `Cobrar / Fiar · ${formatCOP(currentPendingBalance)}`
+            : `Solo vista · ${formatCOP(currentPendingBalance)}`}
         </button>
       </div>
     </div>
@@ -916,6 +936,16 @@ export function TablesPosView({
         })}
       </div>
 
+      {/* Banner si el rol tiene acceso solo vista al POS */}
+      {!canEdit && (
+        <div className="mx-3 mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-warning/35 bg-warning/10 px-3 py-1.5 text-xs font-semibold text-warning lg:mx-0 lg:mb-3 lg:mt-0">
+          <Eye className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            Modo solo vista: puedes consultar mesas, carta y cuentas sin modificar pedidos ni cobrar.
+          </span>
+        </div>
+      )}
+
       {/* Aviso discreto si algún aliado está cerrado */}
       {store.featureFlags.autoHideClosedAllies && closedAllies.length > 0 && (
         <div className="mx-3 mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs text-warning lg:mx-0 lg:mb-3 lg:mt-0">
@@ -1012,7 +1042,7 @@ export function TablesPosView({
                     ? "Crea tu primer barril artesanal, licor, papas, cigarrillos o empanadas desde Barriles & Stock para empezar a vender."
                     : "Prueba otra categoría o limpia la búsqueda."}
                 </p>
-                {store.menuProducts.length === 0 && isAdmin && onGoToInventory && (
+                {store.menuProducts.length === 0 && (canEditInventory ?? isAdmin) && onGoToInventory && (
                   <button
                     type="button"
                     onClick={onGoToInventory}

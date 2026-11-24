@@ -1,20 +1,28 @@
 import { useState } from "react";
 import {
   Clock,
+  Eye,
   ImagePlus,
   Layers,
+  Lock,
   Pencil,
   Plus,
+  RotateCcw,
+  Shield,
   ShieldAlert,
   Sliders,
   Sparkles,
   Trash2,
 } from "lucide-react";
-import type {
-  BranchFeatureFlags,
-  DisplayUnit,
-  PresentationGroup,
-  PromotionRule,
+import {
+  DEFAULT_BRANCH_ROLE_PERMISSIONS,
+  resolveBranchRolePermissions,
+  type AppModuleId,
+  type BranchFeatureFlags,
+  type DisplayUnit,
+  type ModuleAccessLevel,
+  type PresentationGroup,
+  type PromotionRule,
 } from "@liquistock/domain";
 import { ApiError, apiFetch } from "../../infrastructure/api/api-client.js";
 import type { useLiquiStock } from "../../infrastructure/sync/useLiquiStock.js";
@@ -60,16 +68,35 @@ const FLAG_LABELS: Array<{ key: keyof BranchFeatureFlags; label: string; desc: s
   },
 ];
 
+const MODULE_META: Array<{ id: AppModuleId; label: string; desc: string }> = [
+  { id: "pos", label: "Mesas & POS", desc: "Tomar pedidos, dividir cuentas y cobrar" },
+  { id: "inventory", label: "Stock", desc: "Ver existencias vs registrar compras, mermas y productos" },
+  { id: "cash", label: "Caja & Cierre", desc: "Consultar turno/cartera vs cerrar caja y abonos" },
+  { id: "kpis", label: "KPIs", desc: "Métricas de ventas, alertas inteligentes y auditoría" },
+  { id: "settings", label: "Config Bar", desc: "Módulos, aliados, precios, promociones y clientes" },
+  { id: "users", label: "Mi Bar & Equipo", desc: "Perfil del bar, mesas, medios de pago y equipo" },
+];
+
+const CONFIGURABLE_ROLES: Array<{ id: "cashier" | "waiter"; label: string; hint: string }> = [
+  { id: "cashier", label: "Cajero", hint: "Personal de caja y cobros" },
+  { id: "waiter", label: "Mesero", hint: "Personal de salón y barra" },
+];
+
 export function BarConfigView({
   store,
   branchId,
+  canEdit = true,
+  isAdmin = true,
   onGoToPos,
 }: {
   store: StoreType;
   branchId: string;
+  canEdit?: boolean;
+  isAdmin?: boolean;
   onGoToPos?: () => void;
 }) {
   const { toast, showAlertModal } = useFeedback();
+  const [selectedPermRole, setSelectedPermRole] = useState<"cashier" | "waiter">("cashier");
   const [showComboModal, setShowComboModal] = useState(false);
   const [showPromoModal, setShowPromoModal] = useState(false);
   const [editingPromo, setEditingPromo] = useState<PromotionRule | null>(null);
@@ -288,8 +315,51 @@ export function BarConfigView({
     });
   };
 
+  const resolvedRolePermissions = resolveBranchRolePermissions(store.branch?.rolePermissions);
+
+  const handleUpdateRolePermission = async (
+    roleId: "cashier" | "waiter",
+    moduleId: AppModuleId,
+    level: ModuleAccessLevel,
+  ) => {
+    if (!isAdmin || saving) return;
+    const roleLabel = roleId === "cashier" ? "Cajero" : "Mesero";
+    const modLabel = MODULE_META.find((m) => m.id === moduleId)?.label ?? moduleId;
+    const levelLabel =
+      level === "edit" ? "Editor" : level === "view" ? "Solo vista" : "Sin acceso";
+    await runAction(`${roleLabel} → ${modLabel}: ${levelLabel}`, async () => {
+      await apiFetch(`/api/v1/branches/${branchId}/role-permissions`, {
+        method: "PATCH",
+        body: JSON.stringify({ [roleId]: { [moduleId]: level } }),
+      });
+    });
+  };
+
+  const handleResetRolePermissions = async () => {
+    if (!isAdmin || saving) return;
+    await runAction("Permisos por rol restablecidos a valores por defecto", async () => {
+      await apiFetch(`/api/v1/branches/${branchId}/role-permissions`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          cashier: DEFAULT_BRANCH_ROLE_PERMISSIONS.cashier,
+          waiter: DEFAULT_BRANCH_ROLE_PERMISSIONS.waiter,
+        }),
+      });
+    });
+  };
+
   return (
     <div className="space-y-6">
+      {!canEdit && (
+        <div className="flex items-center gap-2 rounded-2xl border border-warning/35 bg-warning/10 px-4 py-3 text-xs font-semibold text-warning">
+          <Eye className="h-4 w-4 shrink-0" />
+          <span>
+            Modo solo vista: puedes consultar la configuración del bar pero no realizar cambios.
+          </span>
+        </div>
+      )}
+
+      <fieldset disabled={!canEdit} className="space-y-6">
       {/* Acción destacada: Constructor de Combos */}
       <section className="solid-card flex flex-wrap items-center justify-between gap-4 rounded-2xl border-primary/30 p-5">
         <div className="flex items-center gap-3">
@@ -360,6 +430,129 @@ export function BarConfigView({
           })}
         </div>
       </section>
+
+      {/* 1B. Permisos Paramétricos por Rol y Módulo (Solo Administrador) */}
+      {isAdmin && (
+        <section className="solid-card space-y-4 rounded-2xl border-primary/25 p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/15 text-primary">
+                <Shield className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="font-display text-lg font-bold">
+                  Permisos de Módulos por Rol
+                </h2>
+                <p className="text-xs text-muted-foreground">
+                  Define qué módulos puede ver o editar cada rol en esta sucursal. El{" "}
+                  <strong>Administrador</strong> siempre mantiene acceso <strong>Editor</strong> en
+                  todos los módulos.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void handleResetRolePermissions()}
+              className="press-response flex min-h-9 items-center gap-1.5 rounded-xl bg-secondary px-3 text-xs font-semibold text-muted-foreground hover:text-foreground disabled:opacity-50"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Restablecer
+            </button>
+          </div>
+
+          {/* Selector de rol a parametrizar */}
+          <div className="flex flex-wrap gap-2">
+            {CONFIGURABLE_ROLES.map((r) => {
+              const active = selectedPermRole === r.id;
+              return (
+                <button
+                  key={r.id}
+                  type="button"
+                  onClick={() => {
+                    haptics.tap();
+                    setSelectedPermRole(r.id);
+                  }}
+                  className={`press-response flex min-h-11 items-center gap-2 rounded-xl border px-4 text-left text-xs transition ${
+                    active
+                      ? "border-primary bg-primary/15 text-foreground"
+                      : "border-white/10 bg-background/50 text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <div>
+                    <p className="font-bold">{r.label}</p>
+                    <p className="text-[10px] opacity-80">{r.hint}</p>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Matriz de módulos con selector 3 niveles: Sin acceso | Solo vista | Editor */}
+          <div className="grid gap-2.5 sm:grid-cols-2">
+            {MODULE_META.map((mod) => {
+              const currentLevel = resolvedRolePermissions[selectedPermRole][mod.id];
+              return (
+                <div
+                  key={mod.id}
+                  className="flex flex-col justify-between gap-2.5 rounded-xl border border-white/10 bg-background/55 p-3.5"
+                >
+                  <div>
+                    <p className="text-sm font-bold text-foreground">{mod.label}</p>
+                    <p className="text-[11px] text-muted-foreground">{mod.desc}</p>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(
+                      [
+                        {
+                          id: "none",
+                          label: "Sin acceso",
+                          icon: Lock,
+                          activeClass:
+                            "border-destructive/50 bg-destructive/15 text-destructive",
+                        },
+                        {
+                          id: "view",
+                          label: "Solo vista",
+                          icon: Eye,
+                          activeClass: "border-warning/55 bg-warning/15 text-warning",
+                        },
+                        {
+                          id: "edit",
+                          label: "Editor",
+                          icon: Pencil,
+                          activeClass: "border-success/55 bg-success/18 text-success",
+                        },
+                      ] as const
+                    ).map(({ id, label, icon: LevelIcon, activeClass }) => {
+                      const active = currentLevel === id;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          disabled={saving}
+                          onClick={() =>
+                            void handleUpdateRolePermission(selectedPermRole, mod.id, id)
+                          }
+                          className={`press-response flex min-h-9 items-center justify-center gap-1 rounded-lg border px-2 text-[11px] font-bold transition disabled:opacity-50 ${
+                            active
+                              ? activeClass
+                              : "border-white/10 bg-secondary/50 text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          <LevelIcon className="h-3 w-3 shrink-0" />
+                          <span className="truncate">{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       {/* 2. Aliados y Horarios de Cierre Automático */}
       <section className="solid-card space-y-4 rounded-2xl p-5">
@@ -949,6 +1142,7 @@ export function BarConfigView({
           </div>
         </section>
       </div>
+      </fieldset>
 
       {showComboModal && (
         <NewComboModal

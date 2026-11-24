@@ -12,6 +12,11 @@ import {
   Wifi,
 } from "lucide-react";
 import {
+  hasModuleAccess,
+  resolveBranchRolePermissions,
+  type AppModuleId,
+} from "@liquistock/domain";
+import {
   apiFetch,
   clearStoredSession,
   getStoredSession,
@@ -35,21 +40,20 @@ import { UsersBranchesView } from "./features/users/UsersBranchesView.js";
 import { FeedbackProvider } from "./shared/components/FeedbackProvider.js";
 import { haptics } from "./shared/lib/haptics.js";
 
-type PosSection = "pos" | "inventory" | "cash" | "kpis" | "settings" | "users";
+type PosSection = AppModuleId;
 
 const NAV_ITEMS: Array<{
   id: PosSection;
   label: string;
   shortLabel: string;
   icon: typeof Beer;
-  roles: Array<"admin" | "cashier" | "waiter">;
 }> = [
-  { id: "pos", label: "Mesas & POS", shortLabel: "POS", icon: UtensilsCrossed, roles: ["admin", "cashier", "waiter"] },
-  { id: "inventory", label: "Stock", shortLabel: "Stock", icon: Beer, roles: ["admin", "cashier", "waiter"] },
-  { id: "cash", label: "Caja & Cierre", shortLabel: "Caja", icon: Receipt, roles: ["admin", "cashier"] },
-  { id: "kpis", label: "KPIs", shortLabel: "KPIs", icon: BarChart3, roles: ["admin"] },
-  { id: "settings", label: "Config Bar", shortLabel: "Config", icon: Settings2, roles: ["admin"] },
-  { id: "users", label: "Mi Bar & Equipo", shortLabel: "Mi Bar", icon: Users, roles: ["admin"] },
+  { id: "pos", label: "Mesas & POS", shortLabel: "POS", icon: UtensilsCrossed },
+  { id: "inventory", label: "Stock", shortLabel: "Stock", icon: Beer },
+  { id: "cash", label: "Caja & Cierre", shortLabel: "Caja", icon: Receipt },
+  { id: "kpis", label: "KPIs", shortLabel: "KPIs", icon: BarChart3 },
+  { id: "settings", label: "Config Bar", shortLabel: "Config", icon: Settings2 },
+  { id: "users", label: "Mi Bar & Equipo", shortLabel: "Mi Bar", icon: Users },
 ];
 
 function AuthenticatedPosShell({
@@ -116,8 +120,13 @@ function AuthenticatedPosShell({
     void refreshProfile();
   }, []);
 
-  const visibleNav = NAV_ITEMS.filter((item) => item.roles.includes(activeRole));
-  const currentSection = visibleNav.some((n) => n.id === section) ? section : "pos";
+  const branchRolePermissions = resolveBranchRolePermissions(store.branch?.rolePermissions);
+  const myPermissions = branchRolePermissions[activeRole];
+  const visibleNav = NAV_ITEMS.filter((item) => hasModuleAccess(myPermissions, item.id, "view"));
+  const currentSection = visibleNav.some((n) => n.id === section)
+    ? section
+    : (visibleNav[0]?.id ?? "pos");
+  const canEditModule = (mod: AppModuleId) => hasModuleAccess(myPermissions, mod, "edit");
 
   const handleSwitchBranch = (nextBranchId: string) => {
     const updated: StoredAuthSession = { ...session, activeBranchId: nextBranchId };
@@ -231,10 +240,21 @@ function AuthenticatedPosShell({
             <div className="m-4 rounded-2xl bg-card p-8 text-center text-sm text-muted-foreground">
               Sincronizando datos de {activeMembership?.branchName ?? "tu sucursal"}...
             </div>
+          ) : visibleNav.length === 0 ? (
+            <div className="m-4 rounded-2xl border border-warning/30 bg-card p-8 text-center">
+              <p className="font-display text-base font-bold text-foreground">
+                Sin módulos habilitados para tu rol
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Pide al Administrador que habilite al menos un módulo para tu rol desde Config Bar.
+              </p>
+            </div>
           ) : currentSection === "pos" ? (
             <TablesPosView
               store={store}
               isAdmin={isAdmin}
+              canEdit={canEditModule("pos")}
+              canEditInventory={canEditModule("inventory")}
               barBranding={
                 activeOrg
                   ? {
@@ -250,15 +270,26 @@ function AuthenticatedPosShell({
               onGoToInventory={() => setSection("inventory")}
             />
           ) : currentSection === "inventory" ? (
-            <InventoryView store={store} branchId={activeBranchId} isAdmin={isAdmin} />
+            <InventoryView
+              store={store}
+              branchId={activeBranchId}
+              isAdmin={canEditModule("inventory")}
+            />
           ) : currentSection === "cash" ? (
-            <CashShiftView store={store} branchId={activeBranchId} />
+            <CashShiftView
+              store={store}
+              branchId={activeBranchId}
+              canEdit={canEditModule("cash")}
+              isAdmin={isAdmin}
+            />
           ) : currentSection === "kpis" ? (
             <KpisView store={store} branchId={activeBranchId} />
           ) : currentSection === "settings" ? (
             <BarConfigView
               store={store}
               branchId={activeBranchId}
+              canEdit={canEditModule("settings")}
+              isAdmin={isAdmin}
               onGoToPos={() => setSection("pos")}
             />
           ) : (
@@ -268,6 +299,8 @@ function AuthenticatedPosShell({
               memberships={session.user.memberships}
               organizations={organizations}
               currentUserId={session.user.userId}
+              canEdit={canEditModule("users")}
+              isAdmin={isAdmin}
               onProfileOrBranchesChanged={refreshProfile}
             />
           )}

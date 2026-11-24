@@ -2,6 +2,67 @@ import type { BaseUnit, DisplayUnit } from "../value-objects/units.js";
 
 export type UserRole = "admin" | "waiter" | "cashier";
 
+export type AppModuleId = "pos" | "inventory" | "cash" | "kpis" | "settings" | "users";
+
+export type ModuleAccessLevel = "none" | "view" | "edit";
+
+export type RoleModulePermissions = Record<AppModuleId, ModuleAccessLevel>;
+
+export type BranchRolePermissions = Record<UserRole, RoleModulePermissions>;
+
+export const DEFAULT_BRANCH_ROLE_PERMISSIONS: BranchRolePermissions = {
+  admin: {
+    pos: "edit",
+    inventory: "edit",
+    cash: "edit",
+    kpis: "edit",
+    settings: "edit",
+    users: "edit",
+  },
+  cashier: {
+    pos: "edit",
+    inventory: "view",
+    cash: "edit",
+    kpis: "none",
+    settings: "none",
+    users: "none",
+  },
+  waiter: {
+    pos: "edit",
+    inventory: "view",
+    cash: "edit",
+    kpis: "none",
+    settings: "none",
+    users: "none",
+  },
+};
+
+export function resolveBranchRolePermissions(
+  raw?: Partial<Record<UserRole, Partial<RoleModulePermissions>>> | null,
+): BranchRolePermissions {
+  return {
+    admin: { ...DEFAULT_BRANCH_ROLE_PERMISSIONS.admin },
+    cashier: {
+      ...DEFAULT_BRANCH_ROLE_PERMISSIONS.cashier,
+      ...(raw?.cashier ?? {}),
+    },
+    waiter: {
+      ...DEFAULT_BRANCH_ROLE_PERMISSIONS.waiter,
+      ...(raw?.waiter ?? {}),
+    },
+  };
+}
+
+export function hasModuleAccess(
+  permissions: RoleModulePermissions,
+  moduleId: AppModuleId,
+  required: "view" | "edit",
+): boolean {
+  const level = permissions[moduleId] ?? "none";
+  if (required === "view") return level === "view" || level === "edit";
+  return level === "edit";
+}
+
 export type CreditStatus = "standard" | "whitelist_credit" | "blacklist_blocked";
 
 export type ProductKind = "standard" | "combo" | "third_party_ally";
@@ -62,6 +123,7 @@ export interface Branch {
   code: string;
   timezone: string;
   featureFlags: BranchFeatureFlags;
+  rolePermissions?: BranchRolePermissions;
   isActive: boolean;
 }
 

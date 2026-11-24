@@ -12,9 +12,10 @@ import { ProcessSyncBatchUseCase } from "../../application/sync/process-sync-bat
 import {
   extractBearerToken,
   loadAuthContextFromToken,
-  requireBranchRole,
+  requireBranchModulePermission,
 } from "../../infrastructure/auth/auth-guard.js";
-import { db, dbEngineLabel } from "../../infrastructure/db/pool.js";
+import { closeDb, db, dbEngineLabel } from "../../infrastructure/db/pool.js";
+import { isCloudinaryConfigured } from "../../infrastructure/media/cloudinary.js";
 import { PostgresSyncRepository } from "../../infrastructure/db/postgres-sync.repository.js";
 import { branchHub } from "../../infrastructure/realtime/branch-hub.js";
 import { registerAdminCatalogRoutes } from "./routes/admin-catalog.routes.js";
@@ -58,6 +59,28 @@ export async function buildServer() {
   // Safe idempotent schema evolution for live embedded PGlite / PostgreSQL instances
   try {
     await db.query(`ALTER TABLE menu_products ADD COLUMN IF NOT EXISTS edition_tag TEXT`);
+    await db.query(
+      `ALTER TABLE branches ADD COLUMN IF NOT EXISTS role_permissions jsonb NOT NULL DEFAULT '{}'::jsonb`,
+    );
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS cash_expenses (
+        id uuid PRIMARY KEY,
+        branch_id uuid NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        cash_shift_id uuid REFERENCES cash_shifts(id) ON DELETE SET NULL,
+        payment_method_id uuid NOT NULL REFERENCES payment_methods(id),
+        category text NOT NULL DEFAULT 'otro',
+        description text NOT NULL,
+        amount numeric(14,2) NOT NULL CHECK (amount > 0),
+        created_by uuid NOT NULL REFERENCES users(id),
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await db.query(
+      `CREATE INDEX IF NOT EXISTS idx_cash_expenses_branch_created ON cash_expenses (branch_id, created_at DESC)`,
+    );
+    await db.query(
+      `ALTER TABLE cash_shifts ADD COLUMN IF NOT EXISTS declared_by_method jsonb NOT NULL DEFAULT '{}'::jsonb`,
+    );
   } catch {
     // Table may not exist yet before migrations run in test harness
   }
@@ -65,8 +88,15 @@ export async function buildServer() {
   const uploadDir = path.resolve(process.env.UPLOAD_DIR ?? "./uploads");
   fs.mkdirSync(uploadDir, { recursive: true });
 
+  const rawCorsOrigins = (process.env.CORS_ORIGIN ?? "")
+    .split(",")
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  const corsOrigin: boolean | string[] =
+    rawCorsOrigins.length === 0 || rawCorsOrigins.includes("*") ? true : rawCorsOrigins;
+
   await app.register(cors, {
-    origin: process.env.CORS_ORIGIN?.split(",") ?? true,
+    origin: corsOrigin,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -83,12 +113,14 @@ export async function buildServer() {
   const syncUseCase = new ProcessSyncBatchUseCase(new PostgresSyncRepository());
 
   app.get("/health", async () => {
+    const mediaStorage = isCloudinaryConfigured() ? "cloudinary" : "local-disk";
     try {
       await db.query("SELECT 1");
       return {
         status: "healthy",
         database: "connected",
         engine: dbEngineLabel,
+        mediaStorage,
         service: "liquistock-api",
       };
     } catch {
@@ -96,6 +128,7 @@ export async function buildServer() {
         status: "degraded",
         database: "unreachable",
         engine: dbEngineLabel,
+        mediaStorage,
         service: "liquistock-api",
       };
     }
@@ -131,11 +164,13 @@ export async function buildServer() {
       });
     }
 
-    const auth = await requireBranchRole(request, reply, parsed.data.branchId, [
-      "admin",
-      "cashier",
-      "waiter",
-    ]);
+    const auth = await requireBranchModulePermission(
+      request,
+      reply,
+      parsed.data.branchId,
+      "pos",
+      "edit",
+    );
     if (!auth) return;
 
     // Enforce server-authenticated actor identity on every command
@@ -175,5 +210,21 @@ if (isMain) {
   const port = Number(process.env.PORT ?? 3001);
   const host = process.env.HOST ?? "0.0.0.0";
   const server = await buildServer();
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.log.info({ signal }, "Shutting down LiquiStock API gracefully...");
+    try {
+      await server.close();
+      await closeDb();
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+
   await server.listen({ port, host });
 }

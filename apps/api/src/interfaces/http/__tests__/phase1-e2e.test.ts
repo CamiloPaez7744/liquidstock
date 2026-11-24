@@ -1079,5 +1079,93 @@ describe("LiquiStock End-to-End Integration (SuperAdmin Approval, Multi-Tenant B
     ).find((p) => p.id === seasonalProductId);
     expect(seasonalProd?.isAvailable).toBe(false);
     expect(seasonalProd?.editionTag).toBe("Edición Limitada");
+
+    // Parametric per-role module permissions E2E
+    // 1) Non-admin cannot change role permissions (403)
+    const waiterPatchPerms = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/branches/${branchId}/role-permissions`,
+      headers: authHeader(waiterToken),
+      payload: { waiter: { kpis: "view" } },
+    });
+    expect(waiterPatchPerms.statusCode).toBe(403);
+
+    // 2) Admin grants waiter KPIs "view" and sets POS to "view" (read-only)
+    const adminPatchPerms = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/branches/${branchId}/role-permissions`,
+      headers: authHeader(adminToken),
+      payload: { waiter: { kpis: "view", pos: "view" } },
+    });
+    expect(adminPatchPerms.statusCode).toBe(200);
+    expect(adminPatchPerms.json().rolePermissions.waiter.kpis).toBe("view");
+    expect(adminPatchPerms.json().rolePermissions.waiter.pos).toBe("view");
+    expect(adminPatchPerms.json().rolePermissions.admin.settings).toBe("edit");
+
+    // 3) Waiter can now read KPIs (200), but CANNOT push POS sync commands because pos is "view" (403)
+    const waiterKpisAllowed = await app.inject({
+      method: "GET",
+      url: `/api/v1/branches/${branchId}/kpis?period=monthly`,
+      headers: authHeader(waiterToken),
+    });
+    expect(waiterKpisAllowed.statusCode).toBe(200);
+
+    const waiterPosBlocked = await app.inject({
+      method: "POST",
+      url: "/api/v1/sync/batch",
+      headers: authHeader(waiterToken),
+      payload: {
+        branchId,
+        deviceId: "waiter-readonly-test",
+        commands: [],
+      },
+    });
+    expect(waiterPosBlocked.statusCode).toBe(403);
+    expect(waiterPosBlocked.json().error).toBe("INSUFFICIENT_MODULE_PERMISSION");
+
+    // Daily Cash Flow + Operating Expenses (servicios) + Role-scoped Period (Waiter=daily, Admin=monthly) E2E
+    const expenseRes = await app.inject({
+      method: "POST",
+      url: `/api/v1/branches/${branchId}/cash-expenses`,
+      headers: authHeader(waiterToken),
+      payload: {
+        paymentMethodId: cashMethodId,
+        category: "servicios",
+        description: "Pago recibo de luz",
+        amount: 35000,
+      },
+    });
+    expect(expenseRes.statusCode).toBe(201);
+
+    // Waiter asking for period=monthly MUST still receive period="daily" (today only)
+    const waiterCashFlow = await app.inject({
+      method: "GET",
+      url: `/api/v1/branches/${branchId}/cash-flow?period=monthly`,
+      headers: authHeader(waiterToken),
+    });
+    expect(waiterCashFlow.statusCode).toBe(200);
+    expect(waiterCashFlow.json().period).toBe("daily");
+    expect(waiterCashFlow.json().isAdminScope).toBe(false);
+    expect(waiterCashFlow.json().balance.totalOutflows).toBe(35000);
+    expect(waiterCashFlow.json().expenses).toHaveLength(1);
+
+    // Admin defaults to monthly and sees grouped movements by payment method
+    const adminCashFlow = await app.inject({
+      method: "GET",
+      url: `/api/v1/branches/${branchId}/cash-flow`,
+      headers: authHeader(adminToken),
+    });
+    expect(adminCashFlow.statusCode).toBe(200);
+    expect(adminCashFlow.json().period).toBe("monthly");
+    expect(adminCashFlow.json().isAdminScope).toBe(true);
+    const cashBucket = (
+      adminCashFlow.json().byPaymentMethod as Array<{
+        paymentMethodId: string;
+        expensesOut: number;
+        movements: Array<{ kind: string }>;
+      }>
+    ).find((m) => m.paymentMethodId === cashMethodId);
+    expect(cashBucket?.expensesOut).toBe(35000);
+    expect(cashBucket?.movements.some((mv) => mv.kind === "expense")).toBe(true);
   });
 });

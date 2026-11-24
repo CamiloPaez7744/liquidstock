@@ -1,12 +1,44 @@
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { convertToBaseUnit, generateUuidV7, type BaseUnit, type DisplayUnit } from "@liquistock/domain";
-import { requireAuth, requireBranchRole } from "../../../infrastructure/auth/auth-guard.js";
+import {
+  convertToBaseUnit,
+  generateUuidV7,
+  resolveBranchRolePermissions,
+  type BaseUnit,
+  type BranchRolePermissions,
+  type DisplayUnit,
+} from "@liquistock/domain";
+import {
+  requireAuth,
+  requireBranchAnyModulePermission,
+  requireBranchModulePermission,
+  requireBranchRole,
+} from "../../../infrastructure/auth/auth-guard.js";
 import { db, withTransaction } from "../../../infrastructure/db/pool.js";
+import {
+  isCloudinaryConfigured,
+  uploadImageToCloudinary,
+} from "../../../infrastructure/media/cloudinary.js";
 import { branchHub } from "../../../infrastructure/realtime/branch-hub.js";
+
+const moduleAccessLevelSchema = z.enum(["none", "view", "edit"]);
+const roleModulePermissionsPatchSchema = z
+  .object({
+    pos: moduleAccessLevelSchema.optional(),
+    inventory: moduleAccessLevelSchema.optional(),
+    cash: moduleAccessLevelSchema.optional(),
+    kpis: moduleAccessLevelSchema.optional(),
+    settings: moduleAccessLevelSchema.optional(),
+    users: moduleAccessLevelSchema.optional(),
+  })
+  .optional();
+
+const branchRolePermissionsPatchSchema = z.object({
+  cashier: roleModulePermissionsPatchSchema,
+  waiter: roleModulePermissionsPatchSchema,
+});
 
 const settingsSchema = z.object({
   enableTables: z.boolean().optional(),
@@ -153,16 +185,30 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
     const ext = file.mimetype.split("/")[1]?.replace("jpeg", "jpg") ?? "png";
     const filename = `${generateUuidV7()}.${ext}`;
-    const destPath = path.join(uploadDir, filename);
+    const buffer = await file.toBuffer();
 
-    await pipeline(file.file, fs.createWriteStream(destPath));
-    return { imageUrl: `/uploads/${filename}` };
+    if (isCloudinaryConfigured()) {
+      try {
+        const secureUrl = await uploadImageToCloudinary(buffer, file.mimetype, filename);
+        return { imageUrl: secureUrl, storage: "cloudinary" };
+      } catch (err) {
+        request.log.error({ err }, "Cloudinary upload failed");
+        return reply.status(502).send({
+          error: "IMAGE_UPLOAD_FAILED",
+          message: "No se pudo subir la imagen a Cloudinary. Verifica las credenciales o intenta de nuevo.",
+        });
+      }
+    }
+
+    const destPath = path.join(uploadDir, filename);
+    await fs.writeFile(destPath, buffer);
+    return { imageUrl: `/uploads/${filename}`, storage: "local" };
   });
 
   // Add dining table to branch (Admin only)
   app.post("/api/v1/branches/:branchId/tables", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
     if (!auth) return;
 
     const parsed = z
@@ -185,7 +231,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/tables/:tableId", async (request, reply) => {
     const { branchId, tableId } = request.params as { branchId: string; tableId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
     if (!auth) return;
 
     const parsed = z
@@ -212,7 +258,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.delete("/api/v1/branches/:branchId/tables/:tableId", async (request, reply) => {
     const { branchId, tableId } = request.params as { branchId: string; tableId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
     if (!auth) return;
 
     const openCheck = await db.query(
@@ -250,7 +296,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Add payment method label to branch (Admin only)
   app.post("/api/v1/branches/:branchId/payment-methods", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
     if (!auth) return;
 
     const parsed = z
@@ -292,7 +338,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
       branchId: string;
       paymentMethodId: string;
     };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
     if (!auth) return;
 
     const parsed = z
@@ -327,7 +373,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
       branchId: string;
       paymentMethodId: string;
     };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
     if (!auth) return;
 
     const activeCountRes = await db.query<{ cnt: string }>(
@@ -365,7 +411,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Toggle modular branch feature flags
   app.patch("/api/v1/branches/:branchId/settings", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = settingsSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -483,7 +529,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Atomically consolidate split sub-accounts into each table's primary account and disable split mode
   app.post("/api/v1/branches/:branchId/settings/consolidate-and-disable-splits", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
 
     const result = await withTransaction(async (client) => {
@@ -597,10 +643,46 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
     return result;
   });
 
+  // Update parametric role module permissions (none | view | edit) — strictly Admin only!
+  app.patch("/api/v1/branches/:branchId/role-permissions", async (request, reply) => {
+    const { branchId } = request.params as { branchId: string };
+    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    if (!auth) return;
+
+    const parsed = branchRolePermissionsPatchSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: "INVALID_ROLE_PERMISSIONS", issues: parsed.error.issues });
+    }
+
+    const currentRes = await db.query<{ role_permissions: Partial<BranchRolePermissions> | null }>(
+      `SELECT role_permissions FROM branches WHERE id = $1`,
+      [branchId],
+    );
+    if (!currentRes.rows[0]) {
+      return reply.status(404).send({ error: "BRANCH_NOT_FOUND" });
+    }
+
+    const current = resolveBranchRolePermissions(currentRes.rows[0].role_permissions);
+    const merged = resolveBranchRolePermissions({
+      cashier: { ...current.cashier, ...(parsed.data.cashier ?? {}) },
+      waiter: { ...current.waiter, ...(parsed.data.waiter ?? {}) },
+    });
+
+    await db.query(
+      `UPDATE branches SET role_permissions = $2::jsonb WHERE id = $1`,
+      [branchId, JSON.stringify(merged)],
+    );
+
+    broadcastCatalogChange(branchId, "ROLE_PERMISSIONS_UPDATED");
+    return { rolePermissions: merged };
+  });
+
   // Create Category (e.g. "Snacks & Papas", "Cigarrillos", "Empanadas de la Casa")
   app.post("/api/v1/branches/:branchId/categories", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = categoryCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -624,7 +706,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create Product (with optional image & ally)
   app.post("/api/v1/branches/:branchId/products", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = productCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -659,7 +741,10 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/products/:productId", async (request, reply) => {
     const { branchId, productId } = request.params as { branchId: string; productId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "settings", requiredLevel: "edit" },
+      { moduleId: "inventory", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
     const parsed = productCreateSchema.partial().safeParse(request.body);
     if (!parsed.success) {
@@ -698,7 +783,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create Presentation (with recipes & foam loss formula)
   app.post("/api/v1/branches/:branchId/presentations", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = presentationCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -761,7 +846,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/presentations/:presentationId", async (request, reply) => {
     const { branchId, presentationId } = request.params as { branchId: string; presentationId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = presentationCreateSchema.partial().safeParse(request.body);
     if (!parsed.success) {
@@ -825,7 +910,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create Ally with operating hours
   app.post("/api/v1/branches/:branchId/allies", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = allyCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -847,7 +932,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // One-step Combo Builder (supports Bar-only combos, Mixed Bar + Ally combos like "Pinta + Salchipapa", or Pure Ally combos)
   app.post("/api/v1/branches/:branchId/combos", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = comboCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -957,7 +1042,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Update Ally schedule or toggle temporarily closed (immediately hides combos across all tablets!)
   app.patch("/api/v1/branches/:branchId/allies/:allyId", async (request, reply) => {
     const { branchId, allyId } = request.params as { branchId: string; allyId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = allyPatchSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -993,7 +1078,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create & toggle Promotions
   app.post("/api/v1/branches/:branchId/promotions", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = promoCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -1031,7 +1116,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/promotions/:promoId", async (request, reply) => {
     const { branchId, promoId } = request.params as { branchId: string; promoId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = promoCreateSchema.partial().safeParse(request.body);
     if (!parsed.success) {
@@ -1083,7 +1168,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.delete("/api/v1/branches/:branchId/promotions/:promoId", async (request, reply) => {
     const { branchId, promoId } = request.params as { branchId: string; promoId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
 
     const deleted = await withTransaction(async (client) => {
@@ -1110,7 +1195,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Manage Customers (Lista Blanca / Lista Negra — Admin only)
   app.post("/api/v1/branches/:branchId/customers", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = customerSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -1130,7 +1215,7 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/customers/:customerId", async (request, reply) => {
     const { branchId, customerId } = request.params as { branchId: string; customerId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
     if (!auth) return;
     const parsed = customerSchema.partial().safeParse(request.body);
     if (!parsed.success) return reply.status(400).send({ error: "INVALID_CUSTOMER_PATCH" });

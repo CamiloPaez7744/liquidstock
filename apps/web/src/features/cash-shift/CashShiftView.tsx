@@ -1,24 +1,121 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   AlertCircle,
+  ArrowDownCircle,
+  ArrowUpCircle,
+  Banknote,
+  Calendar,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Copy,
+  CreditCard,
+  Eye,
   Handshake,
   History,
   Lock,
+  Plus,
   RefreshCw,
+  Scale,
+  Trash2,
   Users,
   Wallet,
 } from "lucide-react";
 import type { CashShiftClosureReport } from "@liquistock/domain";
 import { apiFetch } from "../../infrastructure/api/api-client.js";
 import type { useLiquiStock } from "../../infrastructure/sync/useLiquiStock.js";
+import { useFeedback } from "../../shared/components/FeedbackProvider.js";
 import { formatCOP } from "../../shared/lib/format.js";
 import { haptics } from "../../shared/lib/haptics.js";
 
 type StoreType = ReturnType<typeof useLiquiStock>;
 type CashTab = "current" | "credit" | "allies" | "history";
+type AdminCashPeriod = "monthly" | "daily" | "weekly" | "all" | "date";
+type ExpenseCategory = "servicios" | "insumos" | "nomina" | "mantenimiento" | "transporte" | "otro";
+
+const EXPENSE_CATEGORIES: Array<{ id: ExpenseCategory; label: string }> = [
+  { id: "servicios", label: "Servicios (luz/agua/internet)" },
+  { id: "insumos", label: "Insumos / Hielo / Limones" },
+  { id: "nomina", label: "Turnos / Nómina / DJ" },
+  { id: "mantenimiento", label: "Aseo / Mantenimiento" },
+  { id: "transporte", label: "Domicilio / Transporte" },
+  { id: "otro", label: "Otro pago" },
+];
+
+const EXPENSE_CATEGORY_LABEL: Record<string, string> = {
+  servicios: "Servicios",
+  insumos: "Insumos",
+  nomina: "Turnos / Nómina",
+  mantenimiento: "Mantenimiento",
+  transporte: "Transporte",
+  otro: "Otro pago",
+};
+
+interface CashFlowMethodMovement {
+  id: string;
+  kind: "sale_payment" | "credit_repayment" | "expense";
+  amount: number;
+  label: string;
+  detail: string | null;
+  category: string | null;
+  userName: string;
+  createdAt: string;
+}
+
+interface CashFlowMethodBucket {
+  paymentMethodId: string;
+  name: string;
+  countsAsPhysicalCash: boolean;
+  salesIn: number;
+  repaymentsIn: number;
+  totalIn: number;
+  expensesOut: number;
+  netFlow: number;
+  expectedBalance: number;
+  movements: CashFlowMethodMovement[];
+}
+
+interface CashFlowExpenseRow {
+  id: string;
+  paymentMethodId: string;
+  paymentMethodName: string;
+  category: string;
+  description: string;
+  amount: number;
+  createdAt: string;
+  userName: string;
+}
+
+interface CashFlowResponse {
+  isAdminScope: boolean;
+  period: "daily" | "weekly" | "monthly" | "all" | "date";
+  periodLabel: string;
+  selectedDate: string | null;
+  salesSummary: {
+    grossSales: number;
+    discounts: number;
+    netSales: number;
+    unitsSold: number;
+  };
+  balance: {
+    openingFloat: number;
+    totalSalesInflows: number;
+    totalCreditRepayments: number;
+    totalInflows: number;
+    totalOutflows: number;
+    netCashFlow: number;
+    expectedPhysicalCash: number;
+    creditIssuedInPeriod: number;
+  };
+  pendingTotals: {
+    customerDebtsTotal: number;
+    debtorsCount: number;
+    alliesPendingTotal: number;
+  };
+  byPaymentMethod: CashFlowMethodBucket[];
+  expenses: CashFlowExpenseRow[];
+}
 
 interface CurrentShiftResponse {
   activeShift: {
@@ -85,16 +182,43 @@ interface ClosedShiftRow {
   notes: string | null;
 }
 
-export function CashShiftView({ store, branchId }: { store: StoreType; branchId: string }) {
+function getTodayDateString(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+export function CashShiftView({
+  store,
+  branchId,
+  canEdit = true,
+  isAdmin = false,
+}: {
+  store: StoreType;
+  branchId: string;
+  canEdit?: boolean;
+  isAdmin?: boolean;
+}) {
+  const { toast } = useFeedback();
   const [tab, setTab] = useState<CashTab>("current");
+  const [adminPeriod, setAdminPeriod] = useState<AdminCashPeriod>(isAdmin ? "monthly" : "daily");
+  const [adminDate, setAdminDate] = useState<string>(getTodayDateString());
+  const [cashFlow, setCashFlow] = useState<CashFlowResponse | null>(null);
   const [shiftData, setShiftData] = useState<CurrentShiftResponse["activeShift"]>(null);
-  const [declaredCash, setDeclaredCash] = useState("");
+  const [declaredByMethod, setDeclaredByMethod] = useState<Record<string, string>>({});
+  const [expandedMethods, setExpandedMethods] = useState<Record<string, boolean>>({});
   const [nextShiftFloat, setNextShiftFloat] = useState("200000");
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [closedSummary, setClosedSummary] = useState<CashShiftClosureReport | null>(null);
-  const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Registro de pagos / egresos de caja (servicios, hielo, turnos, etc.)
+  const [showExpenseForm, setShowExpenseForm] = useState(false);
+  const [expenseCategory, setExpenseCategory] = useState<ExpenseCategory>("servicios");
+  const [expenseMethodId, setExpenseMethodId] = useState("");
+  const [expenseDesc, setExpenseDesc] = useState("");
+  const [expenseAmount, setExpenseAmount] = useState("");
 
   // Cartera & Abonos state
   const [repayCustomerId, setRepayCustomerId] = useState<string | null>(null);
@@ -110,9 +234,37 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
   const [shiftHistory, setShiftHistory] = useState<ClosedShiftRow[]>([]);
 
   const notify = (kind: "ok" | "err", text: string) => {
-    setNotice({ kind, text });
-    window.setTimeout(() => setNotice(null), 4000);
+    toast({
+      kind: kind === "ok" ? "success" : "error",
+      title: kind === "ok" ? "Caja actualizada" : "Atención",
+      description: text,
+    });
   };
+
+  const loadCashFlow = useCallback(async () => {
+    try {
+      const qs = !isAdmin
+        ? "period=daily"
+        : adminPeriod === "date"
+          ? `date=${encodeURIComponent(adminDate)}`
+          : `period=${adminPeriod}`;
+      const res = await apiFetch<CashFlowResponse>(
+        `/api/v1/branches/${branchId}/cash-flow?${qs}`,
+      );
+      setCashFlow(res);
+      setDeclaredByMethod((prev) => {
+        const next = { ...prev };
+        for (const m of res.byPaymentMethod) {
+          if (next[m.paymentMethodId] === undefined) {
+            next[m.paymentMethodId] = String(Math.round(m.expectedBalance));
+          }
+        }
+        return next;
+      });
+    } catch {
+      // Offline
+    }
+  }, [branchId, isAdmin, adminPeriod, adminDate]);
 
   const loadShift = useCallback(async () => {
     try {
@@ -120,13 +272,10 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
         `/api/v1/branches/${branchId}/shifts/current`,
       );
       setShiftData(res.activeShift);
-      if (res.activeShift && declaredCash === "") {
-        setDeclaredCash(String(Math.round(res.activeShift.report.expectedPhysicalCash)));
-      }
     } catch {
       // Offline
     }
-  }, [branchId, declaredCash]);
+  }, [branchId]);
 
   const loadAlliesSettlements = useCallback(async () => {
     try {
@@ -153,13 +302,62 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
   }, [branchId]);
 
   useEffect(() => {
-    void loadShift();
-  }, [loadShift, store.lastHydratedAt]);
+    void Promise.all([loadShift(), loadCashFlow()]);
+  }, [loadShift, loadCashFlow, store.lastHydratedAt]);
 
   useEffect(() => {
     if (tab === "allies") void loadAlliesSettlements();
     if (tab === "history") void loadHistory();
   }, [tab, loadAlliesSettlements, loadHistory, store.lastHydratedAt]);
+
+  const handleRecordExpense = async () => {
+    const pmId = expenseMethodId || store.paymentMethods[0]?.id;
+    const amt = Number(expenseAmount);
+    if (!pmId || !expenseDesc.trim() || !amt || amt <= 0) {
+      notify("err", "Escribe el concepto, un monto positivo y el medio de pago.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await apiFetch(`/api/v1/branches/${branchId}/cash-expenses`, {
+        method: "POST",
+        body: JSON.stringify({
+          paymentMethodId: pmId,
+          category: expenseCategory,
+          description: expenseDesc.trim(),
+          amount: amt,
+        }),
+      });
+      haptics.success();
+      setExpenseDesc("");
+      setExpenseAmount("");
+      setShowExpenseForm(false);
+      await Promise.all([loadCashFlow(), loadShift()]);
+      notify("ok", `Pago registrado: ${formatCOP(amt)}`);
+    } catch (err) {
+      haptics.blocked();
+      notify("err", err instanceof Error ? err.message : "No se pudo registrar el pago");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeleteExpense = async (expenseId: string) => {
+    setBusy(true);
+    try {
+      await apiFetch(`/api/v1/branches/${branchId}/cash-expenses/${expenseId}`, {
+        method: "DELETE",
+      });
+      haptics.tap();
+      await Promise.all([loadCashFlow(), loadShift()]);
+      notify("ok", "Pago / egreso eliminado");
+    } catch (err) {
+      haptics.blocked();
+      notify("err", err instanceof Error ? err.message : "No se pudo eliminar el egreso");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const loadCustomerLedger = async (customerId: string) => {
     if (ledgerCustomerId === customerId) {
@@ -202,7 +400,7 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
       setRepayCustomerId(null);
       setRepayAmount("");
       setRepayNotes("");
-      await Promise.all([store.refresh(), loadShift()]);
+      await Promise.all([store.refresh(), loadShift(), loadCashFlow()]);
       if (ledgerCustomerId === customerId) {
         const led = await apiFetch<{ entries: CustomerLedgerRow[] }>(
           `/api/v1/branches/${branchId}/customers/${customerId}/ledger`,
@@ -225,13 +423,28 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
     if (!shiftData || busy) return;
     setBusy(true);
     try {
+      const methods = cashFlow?.byPaymentMethod ?? [];
+      const numericByMethod: Record<string, number> = {};
+      let physicalTotal = 0;
+      for (const m of methods) {
+        const val =
+          declaredByMethod[m.paymentMethodId] !== undefined
+            ? Math.max(0, Number(declaredByMethod[m.paymentMethodId]) || 0)
+            : Math.max(0, m.expectedBalance);
+        numericByMethod[m.paymentMethodId] = val;
+        if (m.countsAsPhysicalCash) {
+          physicalTotal += val;
+        }
+      }
+
       const res = await apiFetch<{ report: CashShiftClosureReport }>(
         `/api/v1/branches/${branchId}/shifts/close`,
         {
           method: "POST",
           body: JSON.stringify({
             userId: store.activeUserId,
-            declaredPhysicalCash: Number(declaredCash) || 0,
+            declaredPhysicalCash: physicalTotal,
+            declaredByMethod: numericByMethod,
             notes,
             openNextShiftFloat: Number(nextShiftFloat) || 0,
           }),
@@ -239,8 +452,13 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
       );
       haptics.success();
       setClosedSummary(res.report);
-      setDeclaredCash("");
-      await Promise.all([store.refresh(), loadShift(), loadHistory()]);
+      setDeclaredByMethod({});
+      setNotes("");
+      await Promise.all([store.refresh(), loadShift(), loadCashFlow(), loadHistory()]);
+      notify("ok", "Cierre de turno guardado y nuevo turno abierto.");
+    } catch (err) {
+      haptics.blocked();
+      notify("err", err instanceof Error ? err.message : "No se pudo cerrar el turno");
     } finally {
       setBusy(false);
     }
@@ -254,7 +472,7 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
         body: JSON.stringify({ userId: store.activeUserId }),
       });
       haptics.success();
-      await Promise.all([loadShift(), loadAlliesSettlements()]);
+      await Promise.all([loadShift(), loadCashFlow(), loadAlliesSettlements()]);
       notify("ok", `Liquidación a ${allyName ?? "aliado"} marcada como pagada ✓`);
     } catch (err) {
       notify("err", err instanceof Error ? err.message : "No se pudo liquidar");
@@ -284,7 +502,7 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
           openingFloat: Number(nextShiftFloat) || 200000,
         }),
       });
-      await loadShift();
+      await Promise.all([loadShift(), loadCashFlow()]);
     } finally {
       setBusy(false);
     }
@@ -339,7 +557,7 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
         <button
           type="button"
           onClick={() => {
-            void loadShift();
+            void Promise.all([loadShift(), loadCashFlow()]);
             if (tab === "allies") void loadAlliesSettlements();
             if (tab === "history") void loadHistory();
             void store.refresh();
@@ -351,244 +569,601 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
         </button>
       </div>
 
-      {notice && (
-        <div
-          className={`flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold ${
-            notice.kind === "ok"
-              ? "border-success/40 bg-success/15 text-success"
-              : "border-destructive/40 bg-destructive/15 text-destructive"
-          }`}
-        >
-          <CheckCircle2 className="h-4 w-4 shrink-0" />
-          <span>{notice.text}</span>
+      {/* Selector de periodo (Admin: Este mes por defecto + filtro por día · Mesero/Cajero: solo Hoy) */}
+      {tab === "current" && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-card/70 px-3.5 py-2.5">
+          <div className="flex items-center gap-2 text-xs">
+            <Calendar className="h-4 w-4 text-primary" />
+            <span className="font-bold text-foreground">
+              {cashFlow?.periodLabel ?? (isAdmin ? "Este mes" : "Hoy")}
+            </span>
+            {!isAdmin && (
+              <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-bold text-primary">
+                Balance neto del día
+              </span>
+            )}
+          </div>
+
+          {isAdmin && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(
+                [
+                  { id: "monthly", label: "Este mes" },
+                  { id: "daily", label: "Hoy" },
+                  { id: "weekly", label: "7 días" },
+                  { id: "all", label: "Todo" },
+                ] as const
+              ).map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => {
+                    haptics.tap();
+                    setAdminPeriod(p.id);
+                    setDeclaredByMethod({});
+                  }}
+                  className={`press-response rounded-lg px-2.5 py-1.5 text-xs font-bold ${
+                    adminPeriod === p.id
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-secondary/70 text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+              <input
+                type="date"
+                value={adminDate}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setAdminDate(val);
+                  if (val) {
+                    setAdminPeriod("date");
+                    setDeclaredByMethod({});
+                  }
+                }}
+                className={`rounded-lg border px-2 py-1 text-xs font-semibold ${
+                  adminPeriod === "date"
+                    ? "border-primary bg-primary/15 text-primary"
+                    : "border-white/15 bg-background text-foreground"
+                }`}
+              />
+            </div>
+          )}
         </div>
       )}
 
-      {/* === TAB 1: TURNO ACTUAL Y CIERRE === */}
-      {tab === "current" &&
-        (!shiftData ? (
-          <div className="solid-card mx-auto max-w-lg space-y-4 rounded-2xl p-6 text-center">
-            <Wallet className="mx-auto h-10 w-10 text-primary" />
-            <h2 className="font-display text-xl font-bold">No hay turno abierto</h2>
-            <p className="text-sm text-muted-foreground">
-              Define la base de efectivo inicial para abrir la caja de esta sucursal.
-            </p>
-            <input
-              type="number"
-              value={nextShiftFloat}
-              onChange={(e) => setNextShiftFloat(e.target.value)}
-              className="w-full rounded-xl border border-white/15 bg-background px-4 py-3 text-center text-lg font-bold tabular-nums"
-            />
-            <button
-              type="button"
-              disabled={busy}
-              onClick={handleOpenShift}
-              className="press-response min-h-13 w-full rounded-2xl bg-primary font-bold text-primary-foreground"
-            >
-              Abrir Turno de Caja
-            </button>
+      {!canEdit && (
+        <div className="flex items-center gap-2 rounded-2xl border border-warning/35 bg-warning/10 px-4 py-3 text-xs font-semibold text-warning">
+          <Eye className="h-4 w-4 shrink-0" />
+          <span>
+            Modo solo vista: puedes consultar balance, cartera, aliados e historial sin cerrar caja
+            ni registrar pagos.
+          </span>
+        </div>
+      )}
+
+      {/* === TAB 1: BALANCE DIARIO / MENSUAL, PAGOS Y CIERRE === */}
+      {tab === "current" && (
+        <div className="space-y-5">
+          {closedSummary && (
+            <div className="flex items-center gap-3 rounded-2xl border border-success/40 bg-success/10 p-4 text-sm text-success">
+              <CheckCircle2 className="h-6 w-6 shrink-0" />
+              <div>
+                <p className="font-bold">Turno cerrado correctamente y nuevo turno abierto.</p>
+                <p className="text-xs">
+                  Vendido: {formatCOP(closedSummary.totalNetSales)} · Recaudado:{" "}
+                  {formatCOP(closedSummary.totalCollectedOverall)} · Aliados:{" "}
+                  {formatCOP(closedSummary.totalAllyPayable)} · Fiado:{" "}
+                  {formatCOP(closedSummary.totalCreditIssued)}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* 4 PILARES DEL BALANCE (NETO DEL DÍA PARA MESERO / PERIODO PARA ADMIN + INGRESOS VS EGRESOS) */}
+          {cashFlow && (
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="solid-card rounded-2xl p-4">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Vendido Neto (
+                  {cashFlow.period === "daily" || cashFlow.period === "date"
+                    ? "Día"
+                    : cashFlow.periodLabel}
+                  )
+                </p>
+                <p className="mt-2 font-display text-2xl font-bold tabular-nums text-foreground">
+                  {formatCOP(cashFlow.salesSummary.netSales)}
+                </p>
+                <p className="mt-1 text-xs tabular-nums text-muted-foreground">
+                  {cashFlow.salesSummary.unitsSold} und · Bruto{" "}
+                  {formatCOP(cashFlow.salesSummary.grossSales)}
+                  {cashFlow.salesSummary.discounts > 0
+                    ? ` · Promos -${formatCOP(cashFlow.salesSummary.discounts)}`
+                    : ""}
+                </p>
+              </div>
+
+              <div className="solid-card rounded-2xl border-success/30 p-4">
+                <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-success">
+                  <ArrowUpCircle className="h-3.5 w-3.5" />
+                  Ingresos Recaudados
+                </p>
+                <p className="mt-2 font-display text-2xl font-bold tabular-nums text-success">
+                  {formatCOP(cashFlow.balance.totalInflows)}
+                </p>
+                <p className="mt-1 text-xs tabular-nums text-muted-foreground">
+                  Ventas {formatCOP(cashFlow.balance.totalSalesInflows)} · Abonos{" "}
+                  {formatCOP(cashFlow.balance.totalCreditRepayments)}
+                </p>
+              </div>
+
+              <div className="solid-card rounded-2xl border-destructive/30 p-4">
+                <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-destructive">
+                  <ArrowDownCircle className="h-3.5 w-3.5" />
+                  Pagos / Egresos
+                </p>
+                <p className="mt-2 font-display text-2xl font-bold tabular-nums text-destructive">
+                  -{formatCOP(cashFlow.balance.totalOutflows)}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {cashFlow.expenses.length} gasto(s) registrado(s)
+                </p>
+              </div>
+
+              <div className="solid-card rounded-2xl border-primary/35 p-4">
+                <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-primary">
+                  <Scale className="h-3.5 w-3.5" />
+                  Balance (Ingresos − Egresos)
+                </p>
+                <p
+                  className={`mt-2 font-display text-2xl font-bold tabular-nums ${
+                    cashFlow.balance.netCashFlow >= 0 ? "text-primary" : "text-destructive"
+                  }`}
+                >
+                  {formatCOP(cashFlow.balance.netCashFlow)}
+                </p>
+                <p className="mt-1 text-[11px] tabular-nums text-muted-foreground">
+                  Deudas cartera:{" "}
+                  <strong className="text-accent">
+                    {formatCOP(cashFlow.pendingTotals.customerDebtsTotal)}
+                  </strong>{" "}
+                  · Aliados:{" "}
+                  <strong className="text-warning">
+                    {formatCOP(cashFlow.pendingTotals.alliesPendingTotal)}
+                  </strong>
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* REGISTRO DE PAGOS / EGRESOS (SERVICIOS, HIELO, INSUMOS, TURNOS) */}
+          <div className="solid-card space-y-3 rounded-2xl p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="font-display text-base font-bold">
+                  Pagos y Egresos del Periodo (Servicios, Insumos, Turnos)
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  Registra salidas de Efectivo, Nequi o cualquier cuenta para cuadrar el balance
+                  real.
+                </p>
+              </div>
+              {canEdit && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    haptics.tap();
+                    setShowExpenseForm((v) => !v);
+                    if (!expenseMethodId && store.paymentMethods[0]) {
+                      setExpenseMethodId(store.paymentMethods[0].id);
+                    }
+                  }}
+                  className="press-response flex min-h-10 items-center gap-1.5 rounded-xl bg-destructive/15 px-3.5 text-xs font-bold text-destructive ring-1 ring-destructive/30"
+                >
+                  <Plus className="h-4 w-4" />
+                  {showExpenseForm ? "Ocultar formulario" : "Registrar Pago / Egreso"}
+                </button>
+              )}
+            </div>
+
+            {canEdit && showExpenseForm && (
+              <div className="space-y-3 rounded-xl border border-destructive/30 bg-destructive/5 p-3.5">
+                <div className="flex flex-wrap gap-1.5">
+                  {EXPENSE_CATEGORIES.map((cat) => (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => {
+                        haptics.tap();
+                        setExpenseCategory(cat.id);
+                      }}
+                      className={`press-response rounded-lg border px-2.5 py-1.5 text-xs font-bold ${
+                        expenseCategory === cat.id
+                          ? "border-destructive bg-destructive/20 text-destructive"
+                          : "border-white/10 bg-background/70 text-muted-foreground"
+                      }`}
+                    >
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid gap-2.5 sm:grid-cols-12">
+                  <input
+                    type="text"
+                    placeholder="Concepto (ej. Recibo de energía, 4 bolsas de hielo, domicilio)"
+                    value={expenseDesc}
+                    onChange={(e) => setExpenseDesc(e.target.value)}
+                    className="rounded-xl border border-white/15 bg-background px-3 py-2.5 text-sm sm:col-span-5"
+                  />
+                  <select
+                    value={expenseMethodId || store.paymentMethods[0]?.id || ""}
+                    onChange={(e) => setExpenseMethodId(e.target.value)}
+                    className="rounded-xl border border-white/15 bg-background px-3 py-2.5 text-sm sm:col-span-3"
+                  >
+                    {store.paymentMethods.map((pm) => (
+                      <option key={pm.id} value={pm.id}>
+                        Sale de: {pm.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="number"
+                    min={1}
+                    placeholder="Monto COP"
+                    value={expenseAmount}
+                    onChange={(e) => setExpenseAmount(e.target.value)}
+                    className="rounded-xl border border-white/15 bg-background px-3 py-2.5 text-sm font-bold tabular-nums sm:col-span-2"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy || !expenseDesc.trim() || !Number(expenseAmount)}
+                    onClick={() => void handleRecordExpense()}
+                    className="press-response min-h-11 rounded-xl bg-destructive px-4 text-xs font-bold text-white disabled:opacity-50 sm:col-span-2"
+                  >
+                    Guardar Pago
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {cashFlow && cashFlow.expenses.length > 0 && (
+              <div className="divide-y divide-white/10 rounded-xl bg-background/50 px-3 text-xs tabular-nums">
+                {cashFlow.expenses.map((exp) => (
+                  <div
+                    key={exp.id}
+                    className="flex flex-wrap items-center justify-between gap-2 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-bold text-destructive">
+                          {EXPENSE_CATEGORY_LABEL[exp.category] ?? exp.category}
+                        </span>
+                        <span className="font-semibold text-foreground">{exp.description}</span>
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-muted-foreground">
+                        {exp.paymentMethodName} · {exp.userName} ·{" "}
+                        {new Date(exp.createdAt).toLocaleTimeString("es-CO", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-destructive">-{formatCOP(exp.amount)}</span>
+                      {canEdit && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          title="Eliminar pago"
+                          onClick={() => void handleDeleteExpense(exp.id)}
+                          className="press-response flex h-7 w-7 items-center justify-center rounded-lg bg-secondary text-muted-foreground hover:text-destructive"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        ) : (
-          (() => {
-            const r = shiftData.report;
-            const declaredNum = Number(declaredCash) || 0;
-            const liveDiscrepancy = declaredNum - r.expectedPhysicalCash;
-            return (
-              <div className="space-y-5">
+
+          {/* VALIDACIÓN POR CUENTA / EFECTIVO + TODOS LOS MOVIMIENTOS AGRUPADOS POR MEDIO DE PAGO */}
+          {cashFlow && (
+            <div className="space-y-3">
+              <div>
+                <h3 className="font-display text-base font-bold">
+                  Validación de Efectivo y Cuentas · Movimientos Agrupados
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  Revisa cada medio de pago (Efectivo, Nequi, Daviplata, Datáfono…) y valida el
+                  saldo real frente a los movimientos.
+                </p>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                {cashFlow.byPaymentMethod.map((method) => {
+                  const declaredStr =
+                    declaredByMethod[method.paymentMethodId] ??
+                    String(Math.round(method.expectedBalance));
+                  const declaredVal = Number(declaredStr) || 0;
+                  const diff = Math.round((declaredVal - method.expectedBalance) * 100) / 100;
+                  const isExpanded =
+                    expandedMethods[method.paymentMethodId] ??
+                    (method.movements.length > 0 && method.movements.length <= 6);
+
+                  return (
+                    <div
+                      key={method.paymentMethodId}
+                      className="solid-card flex flex-col gap-3 rounded-2xl p-4"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2.5">
+                          <div
+                            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${
+                              method.countsAsPhysicalCash
+                                ? "bg-success/15 text-success"
+                                : "bg-primary/15 text-primary"
+                            }`}
+                          >
+                            {method.countsAsPhysicalCash ? (
+                              <Banknote className="h-5 w-5" />
+                            ) : (
+                              <CreditCard className="h-5 w-5" />
+                            )}
+                          </div>
+                          <div>
+                            <h4 className="font-display text-sm font-bold text-foreground">
+                              {method.name}
+                            </h4>
+                            <p className="text-[11px] text-muted-foreground">
+                              {method.countsAsPhysicalCash
+                                ? "Dinero físico en cajón"
+                                : "Cuenta digital / banco"}{" "}
+                              · {method.movements.length} mov.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="text-right tabular-nums">
+                          <p className="text-[10px] uppercase text-muted-foreground">Esperado</p>
+                          <p className="font-display text-lg font-bold text-primary">
+                            {formatCOP(method.expectedBalance)}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2 rounded-xl bg-background/60 p-2.5 text-center text-[11px] tabular-nums">
+                        <div>
+                          <p className="text-muted-foreground">Ingresos</p>
+                          <p className="font-bold text-success">+{formatCOP(method.totalIn)}</p>
+                        </div>
+                        <div>
+                          <p className="text-muted-foreground">Egresos</p>
+                          <p className="font-bold text-destructive">
+                            -{formatCOP(method.expensesOut)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-muted-foreground">
+                            {method.countsAsPhysicalCash && cashFlow.balance.openingFloat > 0
+                              ? "Base"
+                              : "Flujo neto"}
+                          </p>
+                          <p className="font-bold text-foreground">
+                            {method.countsAsPhysicalCash && cashFlow.balance.openingFloat > 0
+                              ? formatCOP(cashFlow.balance.openingFloat)
+                              : formatCOP(method.netFlow)}
+                          </p>
+                        </div>
+                      </div>
+
+                      {canEdit && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-background/50 p-2.5">
+                          <label className="text-[11px] font-semibold text-muted-foreground">
+                            {method.countsAsPhysicalCash
+                              ? "Contado físico:"
+                              : "Validado en cuenta:"}
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="number"
+                              min={0}
+                              value={declaredStr}
+                              onChange={(e) =>
+                                setDeclaredByMethod((prev) => ({
+                                  ...prev,
+                                  [method.paymentMethodId]: e.target.value,
+                                }))
+                              }
+                              className="w-32 rounded-lg border border-white/15 bg-card px-2.5 py-1.5 text-right text-sm font-bold tabular-nums text-foreground focus:border-primary focus:outline-none"
+                            />
+                            <span
+                              className={`min-w-24 text-right text-[11px] font-bold tabular-nums ${
+                                Math.abs(diff) < 1
+                                  ? "text-success"
+                                  : diff < 0
+                                    ? "text-destructive"
+                                    : "text-warning"
+                              }`}
+                            >
+                              {Math.abs(diff) < 1
+                                ? "Cuadre OK"
+                                : diff < 0
+                                  ? formatCOP(diff)
+                                  : `+${formatCOP(diff)}`}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Lista de movimientos agrupados en este medio de pago */}
+                      <div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedMethods((prev) => ({
+                              ...prev,
+                              [method.paymentMethodId]: !isExpanded,
+                            }))
+                          }
+                          className="flex w-full items-center justify-between rounded-lg bg-secondary/50 px-3 py-1.5 text-xs font-semibold text-muted-foreground hover:text-foreground"
+                        >
+                          <span>
+                            Movimientos de {method.name} ({method.movements.length})
+                          </span>
+                          {isExpanded ? (
+                            <ChevronUp className="h-3.5 w-3.5" />
+                          ) : (
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          )}
+                        </button>
+
+                        {isExpanded && (
+                          <div className="mt-2 max-h-56 divide-y divide-white/10 overflow-y-auto rounded-xl bg-background/50 px-3 text-xs tabular-nums">
+                            {method.movements.length === 0 ? (
+                              <p className="py-3 text-center text-[11px] text-muted-foreground">
+                                Sin movimientos en este periodo.
+                              </p>
+                            ) : (
+                              method.movements.map((mv) => (
+                                <div
+                                  key={mv.id}
+                                  className="flex items-center justify-between gap-2 py-2"
+                                >
+                                  <div className="min-w-0">
+                                    <p className="truncate font-semibold text-foreground">
+                                      {mv.label}
+                                    </p>
+                                    <p className="truncate text-[10px] text-muted-foreground">
+                                      {mv.kind === "expense"
+                                        ? `Egreso (${EXPENSE_CATEGORY_LABEL[mv.category ?? "otro"] ?? mv.category})`
+                                        : mv.kind === "credit_repayment"
+                                          ? "Abono cartera"
+                                          : "Venta POS"}{" "}
+                                      · {mv.userName} ·{" "}
+                                      {new Date(mv.createdAt).toLocaleTimeString("es-CO", {
+                                        hour: "2-digit",
+                                        minute: "2-digit",
+                                      })}
+                                    </p>
+                                  </div>
+                                  <span
+                                    className={`shrink-0 font-bold ${
+                                      mv.amount >= 0 ? "text-success" : "text-destructive"
+                                    }`}
+                                  >
+                                    {mv.amount >= 0 ? "+" : ""}
+                                    {formatCOP(mv.amount)}
+                                  </span>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* APERTURA O CIERRE DE TURNO DE CAJA */}
+          {!shiftData ? (
+            <div className="solid-card mx-auto max-w-lg space-y-4 rounded-2xl p-6 text-center">
+              <Wallet className="mx-auto h-10 w-10 text-primary" />
+              <h2 className="font-display text-xl font-bold">No hay turno abierto</h2>
+              <p className="text-sm text-muted-foreground">
+                Define la base de efectivo inicial para abrir la caja de esta sucursal.
+              </p>
+              {canEdit && (
+                <>
+                  <input
+                    type="number"
+                    value={nextShiftFloat}
+                    onChange={(e) => setNextShiftFloat(e.target.value)}
+                    className="w-full rounded-xl border border-white/15 bg-background px-4 py-3 text-center text-lg font-bold tabular-nums"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleOpenShift}
+                    className="press-response min-h-13 w-full rounded-2xl bg-primary font-bold text-primary-foreground"
+                  >
+                    Abrir Turno de Caja
+                  </button>
+                </>
+              )}
+            </div>
+          ) : (
+            canEdit && (
+              <div className="solid-card space-y-4 rounded-2xl border-primary/25 p-5">
                 <div>
-                  <h2 className="font-display text-xl font-bold">
-                    Cierre de Caja (Parcial / Con Deudas)
-                  </h2>
+                  <h3 className="font-display text-base font-bold">
+                    Confirmar Cierre de Turno Nocturno
+                  </h3>
                   <p className="text-xs text-muted-foreground">
                     Turno abierto desde {new Date(shiftData.openedAt).toLocaleString("es-CO")} ·
-                    Base inicial: {formatCOP(r.openingFloat)}
+                    Base inicial: {formatCOP(shiftData.report.openingFloat)}
                   </p>
                 </div>
 
-                {closedSummary && (
-                  <div className="flex items-center gap-3 rounded-2xl border border-success/40 bg-success/10 p-4 text-sm text-success">
-                    <CheckCircle2 className="h-6 w-6 shrink-0" />
-                    <div>
-                      <p className="font-bold">
-                        Turno cerrado correctamente y nuevo turno abierto.
-                      </p>
-                      <p className="text-xs">
-                        Vendido: {formatCOP(closedSummary.totalNetSales)} · Recaudado:{" "}
-                        {formatCOP(closedSummary.totalCollectedOverall)} · Aliados:{" "}
-                        {formatCOP(closedSummary.totalAllyPayable)} · Fiado:{" "}
-                        {formatCOP(closedSummary.totalCreditIssued)}
-                      </p>
-                    </div>
+                {shiftData.openTablesCount > 0 && (
+                  <div className="flex items-center gap-2 rounded-xl border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
+                    <AlertCircle className="h-4 w-4 shrink-0" />
+                    <span>
+                      Hay <strong>{shiftData.openTablesCount} mesa(s) abierta(s)</strong> (
+                      {formatCOP(shiftData.openTablesPendingAmount)}). Al cerrar turno, se
+                      transferirán automáticamente al siguiente turno sin perder ningún pedido.
+                    </span>
                   </div>
                 )}
 
-                {/* LOS 4 PILARES FINANCIEROS */}
-                <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-                  <div className="solid-card rounded-2xl p-4">
-                    <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      1. Total Vendido (Neto)
-                    </p>
-                    <p className="mt-2 font-display text-2xl font-bold tabular-nums text-foreground">
-                      {formatCOP(r.totalNetSales)}
-                    </p>
-                    <p className="mt-1 text-xs tabular-nums text-muted-foreground">
-                      Bruto {formatCOP(r.totalGrossSales)} · Promos -{formatCOP(r.totalDiscounts)}
-                    </p>
-                  </div>
-
-                  <div className="solid-card rounded-2xl border-success/30 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-wider text-success">
-                      2. Recaudado Real
-                    </p>
-                    <p className="mt-2 font-display text-2xl font-bold tabular-nums text-success">
-                      {formatCOP(r.totalCollectedOverall)}
-                    </p>
-                    <div className="mt-2 space-y-1 text-xs tabular-nums">
-                      {r.paymentBreakdown.length === 0 ? (
-                        <p className="text-muted-foreground">Sin pagos aún en este turno</p>
-                      ) : (
-                        r.paymentBreakdown.map((pm) => (
-                          <div key={pm.paymentMethodId} className="flex justify-between">
-                            <span className="text-muted-foreground">{pm.paymentMethodName}</span>
-                            <span className="font-semibold">{formatCOP(pm.totalCollected)}</span>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="solid-card rounded-2xl border-warning/30 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-wider text-warning">
-                      3. Saldo a Pagar a Aliados
-                    </p>
-                    <p className="mt-2 font-display text-2xl font-bold tabular-nums text-warning">
-                      {formatCOP(r.totalAllyPayable)}
-                    </p>
-                    <div className="mt-2 space-y-1.5 text-xs">
-                      {r.allyPayablesByAlly.length === 0 ? (
-                        <p className="text-muted-foreground">Sin saldo pendiente en este turno</p>
-                      ) : (
-                        r.allyPayablesByAlly.map((ally) => (
-                          <div key={ally.allyId} className="flex items-center justify-between gap-2">
-                            <span className="truncate text-foreground">
-                              {ally.allyName}:{" "}
-                              <strong className="tabular-nums">{formatCOP(ally.amount)}</strong>
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => void handleSettleAlly(ally.allyId, ally.allyName)}
-                              className="press-response shrink-0 rounded-lg bg-warning/20 px-2 py-1 text-[10px] font-bold text-warning"
-                            >
-                              Liquidar
-                            </button>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="solid-card rounded-2xl border-accent/30 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-wider text-accent">
-                      4. Saldo Pendiente (Fiado)
-                    </p>
-                    <p className="mt-2 font-display text-2xl font-bold tabular-nums text-accent">
-                      {formatCOP(r.totalCreditIssued)}
-                    </p>
-                    <p className="mt-1 text-xs tabular-nums text-muted-foreground">
-                      Abonos recuperados: +{formatCOP(r.totalCreditRecovered)}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Arqueo de Efectivo y Confirmación de Cierre */}
-                <div className="solid-card space-y-4 rounded-2xl p-5">
-                  <div className="grid gap-4 md:grid-cols-3">
-                    <div className="rounded-xl bg-background/60 p-3.5 tabular-nums">
-                      <p className="text-xs text-muted-foreground">Efectivo esperado en cajón</p>
-                      <p className="mt-1 text-xl font-bold text-primary">
-                        {formatCOP(r.expectedPhysicalCash)}
-                      </p>
-                      <p className="mt-0.5 text-[11px] text-muted-foreground">
-                        Base ({formatCOP(r.openingFloat)}) + Ventas/Abonos en Efectivo
-                      </p>
-                    </div>
-
-                    <div>
-                      <label className="mb-1 block text-xs font-semibold text-muted-foreground">
-                        Efectivo contado físicamente (COP)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        value={declaredCash}
-                        onChange={(e) => setDeclaredCash(e.target.value)}
-                        className="w-full rounded-xl border border-white/15 bg-background px-3.5 py-3 text-lg font-bold tabular-nums text-foreground focus:border-primary focus:outline-none"
-                      />
-                      <p
-                        className={`mt-1 text-xs font-bold tabular-nums ${
-                          Math.abs(liveDiscrepancy) < 1
-                            ? "text-success"
-                            : liveDiscrepancy < 0
-                              ? "text-destructive"
-                              : "text-warning"
-                        }`}
-                      >
-                        {Math.abs(liveDiscrepancy) < 1
-                          ? "Cuadre exacto (+$0)"
-                          : liveDiscrepancy < 0
-                            ? `Faltante: ${formatCOP(liveDiscrepancy)}`
-                            : `Sobrante: +${formatCOP(liveDiscrepancy)}`}
-                      </p>
-                    </div>
-
-                    <div>
-                      <label className="mb-1 block text-xs font-semibold text-muted-foreground">
-                        Base para siguiente turno (COP)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        value={nextShiftFloat}
-                        onChange={(e) => setNextShiftFloat(e.target.value)}
-                        className="w-full rounded-xl border border-white/15 bg-background px-3.5 py-3 text-lg font-bold tabular-nums text-foreground focus:border-primary focus:outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  {shiftData.openTablesCount > 0 && (
-                    <div className="flex items-center gap-2 rounded-xl border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
-                      <AlertCircle className="h-4 w-4 shrink-0" />
-                      <span>
-                        Hay <strong>{shiftData.openTablesCount} mesa(s) abierta(s)</strong> (
-                        {formatCOP(shiftData.openTablesPendingAmount)}). Al cerrar turno, se
-                        transferirán automáticamente al siguiente turno sin perder ningún pedido.
-                      </span>
-                    </div>
-                  )}
-
-                  <div className="flex flex-wrap items-center gap-3">
+                <div className="grid gap-3 md:grid-cols-3">
+                  <div>
+                    <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                      Base para siguiente turno (COP)
+                    </label>
                     <input
-                      type="text"
-                      placeholder="Notas del cierre (ej. cambio de turno sin novedades)..."
-                      value={notes}
-                      onChange={(e) => setNotes(e.target.value)}
-                      className="min-w-60 flex-1 rounded-xl border border-white/15 bg-background px-3.5 py-3 text-sm"
+                      type="number"
+                      min={0}
+                      value={nextShiftFloat}
+                      onChange={(e) => setNextShiftFloat(e.target.value)}
+                      className="w-full rounded-xl border border-white/15 bg-background px-3.5 py-3 text-base font-bold tabular-nums text-foreground focus:border-primary focus:outline-none"
                     />
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={handleCloseShift}
-                      className="press-response flex min-h-13 items-center justify-center gap-2 rounded-2xl bg-primary px-6 text-sm font-bold text-primary-foreground disabled:opacity-50"
-                    >
-                      <Lock className="h-4 w-4" />
-                      Confirmar Cierre de Turno
-                    </button>
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                      Notas del cierre
+                    </label>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <input
+                        type="text"
+                        placeholder="Ej. Cierre nocturno cuadrado sin novedades..."
+                        value={notes}
+                        onChange={(e) => setNotes(e.target.value)}
+                        className="min-w-52 flex-1 rounded-xl border border-white/15 bg-background px-3.5 py-3 text-sm"
+                      />
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={handleCloseShift}
+                        className="press-response flex min-h-12 items-center justify-center gap-2 rounded-2xl bg-primary px-6 text-sm font-bold text-primary-foreground disabled:opacity-50"
+                      >
+                        <Lock className="h-4 w-4" />
+                        Confirmar Cierre
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
-            );
-          })()
-        ))}
+            )
+          )}
+        </div>
+      )}
 
       {/* === TAB 2: CARTERA DE FIADOS Y ABONOS === */}
       {tab === "credit" && (
@@ -654,18 +1229,20 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
                         >
                           {isViewingLedger ? "Ocultar historial" : "Movimientos"}
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setRepayCustomerId(isRepaying ? null : c.id);
-                            setRepayAmount(String(Math.round(c.currentDebt)));
-                            setRepayMethodId(store.paymentMethods[0]?.id ?? "");
-                            setRepayNotes("");
-                          }}
-                          className="press-response rounded-xl bg-success px-4 py-2 text-xs font-bold text-primary-foreground"
-                        >
-                          Registrar Abono
-                        </button>
+                        {canEdit && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRepayCustomerId(isRepaying ? null : c.id);
+                              setRepayAmount(String(Math.round(c.currentDebt)));
+                              setRepayMethodId(store.paymentMethods[0]?.id ?? "");
+                              setRepayNotes("");
+                            }}
+                            className="press-response rounded-xl bg-success px-4 py-2 text-xs font-bold text-primary-foreground"
+                          >
+                            Registrar Abono
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -862,15 +1439,17 @@ export function CashShiftView({ store, branchId }: { store: StoreType; branchId:
                           )}
                           WhatsApp
                         </button>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void handleSettleAlly(group.allyId, group.allyName)}
-                          className="press-response flex items-center gap-1 rounded-xl bg-warning px-4 py-2 text-xs font-bold text-primary-foreground disabled:opacity-50"
-                        >
-                          <Handshake className="h-3.5 w-3.5" />
-                          Marcar Pagado
-                        </button>
+                        {canEdit && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void handleSettleAlly(group.allyId, group.allyName)}
+                            className="press-response flex items-center gap-1 rounded-xl bg-warning px-4 py-2 text-xs font-bold text-primary-foreground disabled:opacity-50"
+                          >
+                            <Handshake className="h-3.5 w-3.5" />
+                            Marcar Pagado
+                          </button>
+                        )}
                       </div>
                     </div>
 

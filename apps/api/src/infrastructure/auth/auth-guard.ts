@@ -1,5 +1,11 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
-import type { UserRole } from "@liquistock/domain";
+import {
+  hasModuleAccess,
+  resolveBranchRolePermissions,
+  type AppModuleId,
+  type BranchRolePermissions,
+  type UserRole,
+} from "@liquistock/domain";
 import { db } from "../db/pool.js";
 import { verifyAuthToken } from "./jwt.js";
 
@@ -170,6 +176,71 @@ export async function requireBranchRole(
     reply.status(403).send({
       error: "INSUFFICIENT_ROLE",
       message: "Esta acción requiere permisos de Administrador.",
+    });
+    return null;
+  }
+
+  return ctx;
+}
+
+export async function requireBranchModulePermission(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  branchId: string,
+  moduleId: AppModuleId,
+  requiredLevel: "view" | "edit",
+): Promise<AuthenticatedContext | null> {
+  return requireBranchAnyModulePermission(request, reply, branchId, [
+    { moduleId, requiredLevel },
+  ]);
+}
+
+export async function requireBranchAnyModulePermission(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  branchId: string,
+  checks: ReadonlyArray<{ moduleId: AppModuleId; requiredLevel: "view" | "edit" }>,
+): Promise<AuthenticatedContext | null> {
+  const ctx = await requireAuth(request, reply);
+  if (!ctx) return null;
+
+  if (ctx.isSuperAdmin) {
+    reply.status(403).send({
+      error: "SUPERADMIN_CANNOT_OPERATE_BAR",
+      message: "El SuperAdmin gestiona la plataforma y aprobaciones, no opera cajas de bares.",
+    });
+    return null;
+  }
+
+  const membership = ctx.memberships.find((m) => m.branchId === branchId);
+  if (!membership) {
+    reply.status(403).send({
+      error: "BRANCH_ACCESS_DENIED",
+      message: "No tienes acceso a esta sucursal o el bar no está aprobado.",
+    });
+    return null;
+  }
+
+  // Admins always hold full edit access on all modules
+  if (membership.role === "admin") {
+    return ctx;
+  }
+
+  const branchRes = await db.query<{ role_permissions: Partial<BranchRolePermissions> | null }>(
+    `SELECT role_permissions FROM branches WHERE id = $1`,
+    [branchId],
+  );
+  const resolved = resolveBranchRolePermissions(branchRes.rows[0]?.role_permissions ?? null);
+  const rolePerms = resolved[membership.role];
+
+  const allowed = checks.some((c) => hasModuleAccess(rolePerms, c.moduleId, c.requiredLevel));
+  if (!allowed) {
+    const wantsEdit = checks.every((c) => c.requiredLevel === "edit");
+    reply.status(403).send({
+      error: "INSUFFICIENT_MODULE_PERMISSION",
+      message: wantsEdit
+        ? "Tu rol está configurado como solo vista o sin acceso de edición en este módulo."
+        : "Tu rol no tiene permiso para acceder a este módulo.",
     });
     return null;
   }

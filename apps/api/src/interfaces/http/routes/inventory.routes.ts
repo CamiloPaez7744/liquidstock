@@ -6,7 +6,7 @@ import {
   type BaseUnit,
   type DisplayUnit,
 } from "@liquistock/domain";
-import { requireBranchRole } from "../../../infrastructure/auth/auth-guard.js";
+import { requireBranchModulePermission } from "../../../infrastructure/auth/auth-guard.js";
 import { db, withTransaction } from "../../../infrastructure/db/pool.js";
 import { branchHub } from "../../../infrastructure/realtime/branch-hub.js";
 
@@ -112,7 +112,7 @@ const createComposedRecipeSchema = z.object({
 export async function registerInventoryRoutes(app: FastifyInstance) {
   app.post("/api/v1/branches/:branchId/inventory/items", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "inventory", "edit");
     if (!auth) return;
     const parsed = createInventoryItemSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -306,7 +306,7 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
     "/api/v1/branches/:branchId/inventory/items/:itemId/purchase-presentations",
     async (request, reply) => {
       const { branchId, itemId } = request.params as { branchId: string; itemId: string };
-      const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+      const auth = await requireBranchModulePermission(request, reply, branchId, "inventory", "edit");
       if (!auth) return;
 
       const parsed = purchasePresentationInputSchema.safeParse(request.body);
@@ -348,7 +348,7 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
   // Supports linking existing inventory items OR creating missing ingredients inline in the same ACID transaction!
   app.post("/api/v1/branches/:branchId/recipes/composed", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "inventory", "edit");
     if (!auth) return;
 
     const parsed = createComposedRecipeSchema.safeParse(request.body);
@@ -541,7 +541,7 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
   // Record purchase (by keg/bottle/pack/tray presentation OR free base quantity), waste, or manual stock adjustment
   app.post("/api/v1/branches/:branchId/inventory/movements", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "inventory", "edit");
     if (!auth) return;
     const parsed = movementSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -649,7 +649,7 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
 
   app.get("/api/v1/branches/:branchId/inventory/ledger", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    const auth = await requireBranchModulePermission(request, reply, branchId, "inventory", "edit");
     if (!auth) return;
 
     const query = request.query as { limit?: string; offset?: string; itemId?: string };

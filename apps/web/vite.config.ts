@@ -33,6 +33,18 @@ export default defineConfig({
               },
             },
           },
+          {
+            // Cache Cloudinary CDN images so production tablets stay fast & offline-ready
+            urlPattern: /^https:\/\/res\.cloudinary\.com\/.*/i,
+            handler: "CacheFirst",
+            options: {
+              cacheName: "liquistock-cloud-images",
+              expiration: {
+                maxEntries: 500,
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
         ],
       },
     }),
@@ -40,6 +52,12 @@ export default defineConfig({
   server: {
     port: 5174,
     host: true,
+    watch: {
+      awaitWriteFinish: {
+        stabilityThreshold: 120,
+        pollInterval: 40,
+      },
+    },
   },
 });
 

@@ -42,12 +42,32 @@ function getPglite(): PGlite {
   return pgliteInstance;
 }
 
+function shouldUseSsl(url: string): boolean {
+  const lower = url.toLowerCase();
+  if (lower.includes("sslmode=disable") || lower.includes("ssl=false")) {
+    return false;
+  }
+  return (
+    lower.includes("sslmode=require") ||
+    lower.includes("sslmode=verify") ||
+    lower.includes("ssl=true") ||
+    lower.includes(".neon.tech") ||
+    lower.includes(".render.com")
+  );
+}
+
 function getPgPool(): pg.Pool {
   if (!pgPool) {
     pgPool = new Pool({
       connectionString: databaseUrl,
-      max: 20,
-      idleTimeoutMillis: 30_000,
+      max: Number(process.env.PG_POOL_MAX ?? 10),
+      idleTimeoutMillis: 20_000,
+      connectionTimeoutMillis: 15_000,
+      ssl: shouldUseSsl(databaseUrl) ? { rejectUnauthorized: false } : undefined,
+    });
+    // Prevent unhandled 'error' crashes when serverless Postgres (e.g. Neon) closes idle connections
+    pgPool.on("error", (err) => {
+      console.error("[pg-pool] idle client error:", err.message);
     });
   }
   return pgPool;

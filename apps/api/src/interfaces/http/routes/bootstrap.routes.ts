@@ -1,5 +1,9 @@
 import type { FastifyInstance } from "fastify";
-import { DEFAULT_BRANCH_FEATURE_FLAGS } from "@liquistock/domain";
+import {
+  DEFAULT_BRANCH_FEATURE_FLAGS,
+  resolveBranchRolePermissions,
+  type BranchRolePermissions,
+} from "@liquistock/domain";
 import { requireAuth, requireBranchRole } from "../../../infrastructure/auth/auth-guard.js";
 import { db } from "../../../infrastructure/db/pool.js";
 
@@ -36,10 +40,13 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       code: string;
       timezone: string;
       featureFlags: Record<string, boolean> | null;
+      rolePermissions: Partial<BranchRolePermissions> | null;
       isActive: boolean;
     }>(
       `SELECT id, organization_id AS "organizationId", name, code, timezone,
-              feature_flags AS "featureFlags", is_active AS "isActive"
+              feature_flags AS "featureFlags",
+              role_permissions AS "rolePermissions",
+              is_active AS "isActive"
        FROM branches WHERE id = $1`,
       [branchId],
     );
@@ -259,6 +266,7 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
           ...DEFAULT_BRANCH_FEATURE_FLAGS,
           ...(branch.featureFlags ?? {}),
         },
+        rolePermissions: resolveBranchRolePermissions(branch.rolePermissions),
       },
       users: usersRes.rows,
       diningTables: tablesRes.rows,

@@ -7,8 +7,22 @@ function resolveDefaultOrigin(protocol: "http" | "ws"): string {
   return `${protocol}://localhost:3001`;
 }
 
-export const API_BASE_URL = import.meta.env.VITE_API_URL || resolveDefaultOrigin("http");
-export const WS_BASE_URL = import.meta.env.VITE_WS_URL || resolveDefaultOrigin("ws");
+function normalizeOrigin(url?: string): string {
+  return (url ?? "").trim().replace(/\/+$/, "");
+}
+
+function deriveWsOriginFromHttp(httpUrl: string): string {
+  if (httpUrl.startsWith("https://")) return `wss://${httpUrl.slice("https://".length)}`;
+  if (httpUrl.startsWith("http://")) return `ws://${httpUrl.slice("http://".length)}`;
+  return httpUrl;
+}
+
+const configuredApiUrl = normalizeOrigin(import.meta.env.VITE_API_URL);
+const configuredWsUrl = normalizeOrigin(import.meta.env.VITE_WS_URL);
+
+export const API_BASE_URL = configuredApiUrl || resolveDefaultOrigin("http");
+export const WS_BASE_URL =
+  configuredWsUrl || (configuredApiUrl ? deriveWsOriginFromHttp(configuredApiUrl) : resolveDefaultOrigin("ws"));
 
 const SESSION_STORAGE_KEY = "liquistock_auth_session_v2";
 

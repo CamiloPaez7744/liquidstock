@@ -41,6 +41,9 @@ importers:
       pg:
         specifier: ^8.14.1
         version: 8.23.1
+      tsx:
+        specifier: ^4.19.3
+        version: 4.23.15
       zod:
         specifier: ^3.24.2
         version: 3.25.76
@@ -54,9 +57,6 @@ importers:
       '@types/ws':
         specifier: ^8.18.0
         version: 8.18.2
-      tsx:
-        specifier: ^4.19.3
-        version: 4.23.15
       typescript:
         specifier: ^5.8.2
         version: 5.9.3
