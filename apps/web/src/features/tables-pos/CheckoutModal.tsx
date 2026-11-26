@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   CreditCard,
   Gift,
+  PlusCircle,
   Search,
   ShieldCheck,
   Sparkles,
@@ -35,6 +36,7 @@ interface CheckoutModalProps {
   promotionRules: PromotionRule[];
   enableCredit: boolean;
   isAdmin: boolean;
+  initialMode?: "pay" | "credit" | "courtesy" | "extra";
   onQuickAddWhitelistCustomer: (input: {
     fullName: string;
     nickname?: string;
@@ -43,11 +45,26 @@ interface CheckoutModalProps {
   }) => Promise<Customer>;
   onPromoteToWhitelist: (customerId: string) => Promise<void>;
   onAdjustItemPrice: (orderItemId: string, newLineTotal: number, reason: string) => Promise<void>;
+  onAddCustomCharge: (input: {
+    description: string;
+    amount: number;
+    categoryLabel?: string;
+    quantity?: number;
+  }) => Promise<void>;
   onApplyManualPromo: (rule: PromotionRule) => Promise<void>;
   onPay: (paymentMethodId: string, amount: number, methodName: string) => Promise<void>;
   onChargeCredit: (customer: Customer, amount: number, adminOverride: boolean) => Promise<void>;
   onClose: () => void;
 }
+
+const CUSTOM_CHARGE_PRESETS: Array<{ label: string; categoryLabel: string; placeholderAmount: string }> = [
+  { label: "Vaso / Copa rota", categoryLabel: "Reposición / Daño", placeholderAmount: "15000" },
+  { label: "Descorche", categoryLabel: "Descorche", placeholderAmount: "30000" },
+  { label: "Servicio / Propina", categoryLabel: "Servicio", placeholderAmount: "10000" },
+  { label: "Daño / Reposición", categoryLabel: "Reposición / Daño", placeholderAmount: "20000" },
+  { label: "Domicilio / Empaque", categoryLabel: "Adicional", placeholderAmount: "5000" },
+  { label: "Otro cobro adicional", categoryLabel: "Cargo adicional", placeholderAmount: "" },
+];
 
 export function CheckoutModal({
   tableLabel,
@@ -58,16 +75,23 @@ export function CheckoutModal({
   promotionRules,
   enableCredit,
   isAdmin,
+  initialMode = "pay",
   onQuickAddWhitelistCustomer,
   onPromoteToWhitelist,
   onAdjustItemPrice,
+  onAddCustomCharge,
   onApplyManualPromo,
   onPay,
   onChargeCredit,
   onClose,
 }: CheckoutModalProps) {
   const remaining = Math.max(0, subAccount.totalAmount - subAccount.paidAmount - subAccount.creditAmount);
-  const [mode, setMode] = useState<"pay" | "credit" | "courtesy">("pay");
+  const [mode, setMode] = useState<"pay" | "credit" | "courtesy" | "extra">(initialMode);
+  const [extraDescription, setExtraDescription] = useState("");
+  const [extraCategoryLabel, setExtraCategoryLabel] = useState("Reposición / Daño");
+  const [extraAmount, setExtraAmount] = useState("");
+  const [extraQty, setExtraQty] = useState("1");
+  const [extraError, setExtraError] = useState<string | null>(null);
   const [selectedMethodId, setSelectedMethodId] = useState(paymentMethods[0]?.id ?? "");
   const [payAmount, setPayAmount] = useState(String(Math.round(remaining)));
   const [cashTendered, setCashTendered] = useState(String(Math.round(remaining)));
@@ -94,12 +118,17 @@ export function CheckoutModal({
 
   const manualPromosWithPreview = useMemo(() => {
     const lineInputs = items
-      .filter((i) => i.status === "active" && !i.adjustmentReason)
+      .filter(
+        (i) =>
+          i.status === "active" &&
+          !i.adjustmentReason &&
+          Boolean(i.menuProductId && i.presentationId && i.categoryId),
+      )
       .map((i) => ({
         id: i.id,
-        categoryId: i.categoryId,
-        menuProductId: i.menuProductId,
-        presentationId: i.presentationId,
+        categoryId: i.categoryId!,
+        menuProductId: i.menuProductId!,
+        presentationId: i.presentationId!,
         presentationGroup: i.presentationGroupSnap,
         unitPrice: i.unitPriceSnap,
         quantity: i.quantity,
@@ -194,6 +223,9 @@ export function CheckoutModal({
             <h2 className="font-display text-lg font-bold sm:text-xl">
               Cobrar · {tableLabel} ({subAccount.label})
             </h2>
+            {subAccount.description && (
+              <p className="text-xs font-semibold text-primary">{subAccount.description}</p>
+            )}
             <p className="text-xs text-muted-foreground">
               {items.length} línea(s) · Aplica cortesías, promos manuales o cobra
             </p>
@@ -243,7 +275,7 @@ export function CheckoutModal({
               </div>
             </div>
 
-            <div className={`grid gap-2 ${enableCredit ? "grid-cols-3" : "grid-cols-2"}`}>
+            <div className={`grid gap-2 ${enableCredit ? "grid-cols-2 sm:grid-cols-4" : "grid-cols-3"}`}>
               <button
                 type="button"
                 onClick={() => {
@@ -273,6 +305,22 @@ export function CheckoutModal({
               >
                 <Gift className="h-4 w-4" />
                 Cortesía / Promo
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  haptics.tap();
+                  setExtraError(null);
+                  setMode("extra");
+                }}
+                className={`press-response flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-2xl px-2 text-xs font-bold ${
+                  mode === "extra"
+                    ? "bg-accent text-white"
+                    : "bg-secondary text-muted-foreground"
+                }`}
+              >
+                <PlusCircle className="h-4 w-4" />
+                Adicional
               </button>
               {enableCredit && (
                 <button
@@ -549,6 +597,169 @@ export function CheckoutModal({
                     })}
                   </div>
                 </div>
+              </div>
+            ) : mode === "extra" ? (
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-accent">
+                    <PlusCircle className="h-3.5 w-3.5" />
+                    Agregar Cargo / Ingreso Adicional a la Cuenta
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Úsalo para cobrar vasos o copas rotas, descorche, daños, servicio o cualquier
+                    cargo extra. Suma directo a esta cuenta y entra al recaudo sin tocar inventario.
+                  </p>
+
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {CUSTOM_CHARGE_PRESETS.map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          haptics.tap();
+                          setExtraDescription(preset.label === "Otro cobro adicional" ? "" : preset.label);
+                          setExtraCategoryLabel(preset.categoryLabel);
+                          if (preset.placeholderAmount && !extraAmount) {
+                            setExtraAmount(preset.placeholderAmount);
+                          }
+                          setExtraError(null);
+                        }}
+                        className={`press-response rounded-xl border px-2.5 py-1.5 text-xs font-bold ${
+                          extraDescription === preset.label
+                            ? "border-accent bg-accent/20 text-accent"
+                            : "border-white/10 bg-secondary/70 text-foreground"
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-3 rounded-2xl border border-accent/30 bg-accent/8 p-3.5">
+                  <div>
+                    <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                      Concepto del cobro *
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Ej. Vaso pinta roto, descorche botella, daño mesa..."
+                      value={extraDescription}
+                      onChange={(e) => {
+                        setExtraDescription(e.target.value);
+                        setExtraError(null);
+                      }}
+                      className="w-full rounded-xl border border-white/15 bg-background px-3.5 py-2.5 text-sm text-foreground focus:border-accent focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2.5">
+                    <div className="col-span-2">
+                      <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                        Valor unitario (COP) *
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        placeholder="15000"
+                        value={extraAmount}
+                        onChange={(e) => {
+                          setExtraAmount(e.target.value);
+                          setExtraError(null);
+                        }}
+                        className="w-full rounded-xl border border-white/15 bg-background px-3.5 py-2.5 text-base font-bold tabular-nums text-foreground focus:border-accent focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                        Cantidad
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={extraQty}
+                        onChange={(e) => setExtraQty(e.target.value)}
+                        className="w-full rounded-xl border border-white/15 bg-background px-3 py-2.5 text-base font-bold tabular-nums text-foreground focus:border-accent focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {extraError && (
+                    <p className="rounded-xl bg-destructive/15 px-3 py-2 text-xs font-semibold text-destructive">
+                      {extraError}
+                    </p>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={async () => {
+                      const desc = extraDescription.trim();
+                      const amt = Number(extraAmount);
+                      const qty = Math.max(1, Math.round(Number(extraQty) || 1));
+                      if (!desc) {
+                        setExtraError("Escribe el concepto del cobro adicional.");
+                        return;
+                      }
+                      if (!Number.isFinite(amt) || amt <= 0) {
+                        setExtraError("Ingresa un valor mayor a $0.");
+                        return;
+                      }
+                      setBusy(true);
+                      try {
+                        await onAddCustomCharge({
+                          description: desc,
+                          amount: amt,
+                          categoryLabel: extraCategoryLabel,
+                          quantity: qty,
+                        });
+                        haptics.success();
+                        setExtraDescription("");
+                        setExtraAmount("");
+                        setExtraQty("1");
+                        setExtraError(null);
+                        setMode("pay");
+                      } catch (err) {
+                        haptics.blocked();
+                        setExtraError(
+                          err instanceof Error ? err.message : "No se pudo agregar el cargo",
+                        );
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                    className="press-response flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-accent px-4 text-sm font-bold text-white disabled:opacity-50"
+                  >
+                    <PlusCircle className="h-4 w-4" />
+                    Agregar a la cuenta y volver a cobrar
+                    {Number(extraAmount) > 0
+                      ? ` (+${formatCOP(Number(extraAmount) * Math.max(1, Math.round(Number(extraQty) || 1)))})`
+                      : ""}
+                  </button>
+                </div>
+
+                {items.filter((i) => !i.presentationId).length > 0 && (
+                  <div className="space-y-1.5">
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Cargos adicionales en esta cuenta
+                    </p>
+                    <div className="divide-y divide-white/10 rounded-xl bg-background/60 px-3 text-xs tabular-nums">
+                      {items
+                        .filter((i) => !i.presentationId)
+                        .map((extra) => (
+                          <div key={extra.id} className="flex items-center justify-between py-2">
+                            <span className="font-semibold text-foreground">
+                              {extra.quantity}× {extra.productNameSnap}
+                            </span>
+                            <span className="font-bold text-accent">
+                              +{formatCOP(extra.lineTotal)}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="space-y-3">

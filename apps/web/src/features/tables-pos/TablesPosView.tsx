@@ -2,13 +2,18 @@ import { useMemo, useState } from "react";
 import {
   ArrowRightLeft,
   Beer,
+  Check,
   ChevronDown,
   ChevronRight,
   Clock,
   CreditCard,
   Eye,
   Handshake,
+  Layers,
+  Lock,
+  Pencil,
   Plus,
+  PlusCircle,
   Search,
   ShoppingBag,
   Sparkles,
@@ -19,8 +24,10 @@ import {
 } from "lucide-react";
 import {
   evaluatePresentationAvailability,
+  getMatchingComboTemplatesForPresentation,
   getQuickPromoOffersForPresentation,
   isAllyOpenAt,
+  type ComboTemplate,
   type MenuProduct,
   type ProductPresentation,
 } from "@liquistock/domain";
@@ -48,6 +55,7 @@ export function TablesPosView({
   canEditInventory,
   barBranding,
   onGoToInventory,
+  onGoToCash,
 }: {
   store: StoreType;
   isAdmin: boolean;
@@ -55,6 +63,7 @@ export function TablesPosView({
   canEditInventory?: boolean;
   barBranding?: ReceiptBarBranding;
   onGoToInventory?: () => void;
+  onGoToCash?: () => void;
 }) {
   const { toast, showAlertModal } = useFeedback();
   const [selectedTableId, setSelectedTableId] = useState<string | null>(
@@ -70,6 +79,17 @@ export function TablesPosView({
   const [draggingSubAccountId, setDraggingSubAccountId] = useState<string | null>(null);
   const [isOverTrashZone, setIsOverTrashZone] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
+  const [checkoutInitialMode, setCheckoutInitialMode] = useState<
+    "pay" | "credit" | "courtesy" | "extra"
+  >("pay");
+  const [editingTableName, setEditingTableName] = useState(false);
+  const [tableNameDraft, setTableNameDraft] = useState("");
+  const [renamingTable, setRenamingTable] = useState(false);
+  const [subAccountEditorMode, setSubAccountEditorMode] = useState<"closed" | "edit" | "create">(
+    "closed",
+  );
+  const [subLabelDraft, setSubLabelDraft] = useState("");
+  const [subDescDraft, setSubDescDraft] = useState("");
   const [receipt, setReceipt] = useState<DigitalReceiptData | null>(null);
 
   const { isoDay, hhmm, yyyymmdd } = getCurrentIsoDayAndTime();
@@ -127,6 +147,7 @@ export function TablesPosView({
   const qtyByPresentationId = useMemo(() => {
     const map = new Map<string, number>();
     for (const item of currentSubItems) {
+      if (!item.presentationId) continue;
       map.set(item.presentationId, (map.get(item.presentationId) ?? 0) + item.quantity);
     }
     return map;
@@ -136,7 +157,7 @@ export function TablesPosView({
   const promoLinesByKey = useMemo(() => {
     const map = new Map<string, number>();
     for (const item of currentSubItems) {
-      if (item.promotionRuleId && item.discountAmount > 0) {
+      if (item.presentationId && item.promotionRuleId && item.discountAmount > 0) {
         const key = `${item.presentationId}:${item.promotionRuleId}`;
         map.set(key, (map.get(key) ?? 0) + 1);
       }
@@ -279,11 +300,41 @@ export function TablesPosView({
       });
   }, [evaluatedCatalog, selectedCategoryId, search]);
 
+  const shiftMissing = !store.loading && !store.activeShift;
+  const shiftExpired24h = Boolean(store.activeShift?.isExpired24h);
+  const posBlockedByShift = shiftMissing || shiftExpired24h;
+
+  const assertShiftOpenForSale = (): boolean => {
+    if (!posBlockedByShift) return true;
+    haptics.blocked();
+    showAlertModal({
+      tone: "warning",
+      title: shiftExpired24h ? "Turno abierto por más de 24 horas" : "Apertura de caja requerida",
+      description: shiftExpired24h
+        ? "El turno actual lleva más de 24 horas abierto. Ciérralo y realiza una nueva apertura de caja para continuar vendiendo."
+        : "Debes realizar la apertura de caja del día antes de iniciar ventas o abrir mesas en el POS.",
+      actions: [
+        ...(onGoToCash
+          ? [
+              {
+                label: shiftExpired24h ? "Ir a Cerrar / Abrir Caja" : "Ir a Abrir Caja",
+                variant: "primary" as const,
+                onClick: () => onGoToCash(),
+              },
+            ]
+          : []),
+        { label: "Entendido", variant: "secondary" as const },
+      ],
+    });
+    return false;
+  };
+
   const handleTapPresentation = async (
     product: MenuProduct,
     presentation: ProductPresentation,
     quantity = 1,
     forcedPromotionRuleId?: string | null,
+    comboTemplate?: ComboTemplate | null,
   ) => {
     if (!canEdit) {
       haptics.blocked();
@@ -294,6 +345,7 @@ export function TablesPosView({
       });
       return;
     }
+    if (!assertShiftOpenForSale()) return;
     haptics.tap();
     let targetSubId = currentSubAccount?.id;
     if (!targetSubId) {
@@ -307,29 +359,74 @@ export function TablesPosView({
       presentation,
       quantity,
       forcedPromotionRuleId ?? null,
+      comboTemplate ?? null,
     );
   };
 
-  const handleSplitAccount = async () => {
-    if (!canEdit) return;
-    haptics.tap();
-    if (!activeSession) {
-      const opened = await store.openTableSession(selectedTableId, "Cuenta 1");
-      setSelectedSubAccountId(opened.subAccountId);
-      return;
-    }
+  const getNextSubAccountLabel = () => {
     const usedLabels = new Set(sessionSubAccounts.map((sa) => sa.label));
     let nextNum = sessionSubAccounts.length + 1;
     while (usedLabels.has(`Cuenta ${nextNum}`)) {
       nextNum += 1;
     }
-    const newId = await store.createSubAccount(activeSession.id, `Cuenta ${nextNum}`);
-    setSelectedSubAccountId(newId);
-    toast({
-      kind: "info",
-      title: `Cuenta ${nextNum} creada`,
-      description: `Ya puedes agregar o mover productos a Cuenta ${nextNum} en ${currentTableLabel}.`,
-    });
+    return `Cuenta ${nextNum}`;
+  };
+
+  const handleSplitAccount = () => {
+    if (!canEdit) return;
+    if (!assertShiftOpenForSale()) return;
+    haptics.tap();
+    setSubLabelDraft(getNextSubAccountLabel());
+    setSubDescDraft("");
+    setSubAccountEditorMode("create");
+  };
+
+  const handleOpenEditSubAccount = (sa: LocalSubAccount) => {
+    if (!canEdit) return;
+    haptics.tap();
+    setSelectedSubAccountId(sa.id);
+    setSubLabelDraft(sa.label);
+    setSubDescDraft(sa.description ?? "");
+    setSubAccountEditorMode("edit");
+  };
+
+  const handleSaveSubAccountEditor = async () => {
+    if (!canEdit) return;
+    const cleanLabel = subLabelDraft.trim() || getNextSubAccountLabel();
+    const cleanDesc = subDescDraft.trim() || null;
+
+    if (subAccountEditorMode === "create") {
+      if (!assertShiftOpenForSale()) return;
+      if (!activeSession) {
+        const opened = await store.openTableSession(selectedTableId, cleanLabel, cleanDesc);
+        setSelectedSubAccountId(opened.subAccountId);
+      } else {
+        const newId = await store.createSubAccount(activeSession.id, cleanLabel, cleanDesc);
+        setSelectedSubAccountId(newId);
+      }
+      haptics.success();
+      setSubAccountEditorMode("closed");
+      toast({
+        kind: "info",
+        title: `Cuenta "${cleanLabel}" creada`,
+        description: cleanDesc ?? `Lista para agregar o mover productos en ${currentTableLabel}.`,
+      });
+      return;
+    }
+
+    if (subAccountEditorMode === "edit" && currentSubAccount) {
+      await store.updateSubAccount(currentSubAccount.id, {
+        label: cleanLabel,
+        description: cleanDesc,
+      });
+      haptics.success();
+      setSubAccountEditorMode("closed");
+      toast({
+        kind: "success",
+        title: `Cuenta actualizada: "${cleanLabel}"`,
+        description: cleanDesc ?? "Etiqueta guardada sin descripción adicional.",
+      });
+    }
   };
 
   const requestDeleteSubAccount = (sa: LocalSubAccount) => {
@@ -476,7 +573,59 @@ export function TablesPosView({
     setSelectedTableId(tableId);
     setSelectedSubAccountId(null);
     setMovingItemId(null);
+    setEditingTableName(false);
+    setSubAccountEditorMode("closed");
     setShowTablePicker(false);
+  };
+
+  const handleSaveTableName = async () => {
+    if (!selectedTableId || !canEdit || renamingTable) return;
+    const trimmed = tableNameDraft.trim();
+    if (!trimmed) {
+      toast({
+        kind: "error",
+        title: "Nombre inválido",
+        description: "Escribe un nombre para la mesa.",
+      });
+      return;
+    }
+    if (trimmed === currentTableLabel) {
+      setEditingTableName(false);
+      return;
+    }
+    setRenamingTable(true);
+    try {
+      await store.renameDiningTable(selectedTableId, trimmed);
+      haptics.success();
+      setEditingTableName(false);
+      toast({
+        kind: "success",
+        title: "Mesa renombrada",
+        description: `Ahora se llama "${trimmed}".`,
+      });
+    } catch (err) {
+      haptics.blocked();
+      toast({
+        kind: "error",
+        title: "No se pudo renombrar la mesa",
+        description: err instanceof Error ? err.message : "Intenta con otro nombre.",
+      });
+    } finally {
+      setRenamingTable(false);
+    }
+  };
+
+  const handleOpenQuickExtraCharge = async () => {
+    if (!canEdit) return;
+    if (!assertShiftOpenForSale()) return;
+    haptics.tap();
+    if (!currentSubAccount) {
+      const opened = await store.openTableSession(selectedTableId, "Cuenta 1");
+      setSelectedSubAccountId(opened.subAccountId);
+    }
+    setShowMobileOrderSheet(false);
+    setCheckoutInitialMode("extra");
+    setShowCheckout(true);
   };
 
   // Shared Comanda & Sub-Accounts content (used inside Desktop sidebar AND Mobile Bottom Sheet)
@@ -484,8 +633,63 @@ export function TablesPosView({
     <div className="flex h-full min-h-0 flex-col">
       <div className="shrink-0 border-b border-white/10 px-4 py-3">
         <div className="flex items-center justify-between gap-2">
-          <div>
-            <h2 className="font-display text-base font-bold">{currentTableLabel}</h2>
+          <div className="min-w-0 flex-1">
+            {editingTableName && selectedTableId !== null && canEdit ? (
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="text"
+                  autoFocus
+                  maxLength={40}
+                  value={tableNameDraft}
+                  onChange={(e) => setTableNameDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleSaveTableName();
+                    } else if (e.key === "Escape") {
+                      setEditingTableName(false);
+                    }
+                  }}
+                  className="min-w-0 flex-1 rounded-lg border border-primary/60 bg-background px-2.5 py-1 text-sm font-bold text-foreground focus:outline-none"
+                />
+                <button
+                  type="button"
+                  disabled={renamingTable}
+                  title="Guardar nombre"
+                  onClick={() => void handleSaveTableName()}
+                  className="press-response flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-success/20 text-success"
+                >
+                  <Check className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  title="Cancelar"
+                  onClick={() => setEditingTableName(false)}
+                  className="press-response flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-secondary text-muted-foreground"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <h2 className="truncate font-display text-base font-bold">{currentTableLabel}</h2>
+                {selectedTableId !== null && canEdit && (
+                  <button
+                    type="button"
+                    title="Editar nombre de esta mesa"
+                    aria-label="Editar nombre de esta mesa"
+                    onClick={() => {
+                      haptics.tap();
+                      setTableNameDraft(currentTableLabel);
+                      setEditingTableName(true);
+                    }}
+                    className="press-response flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-secondary/70 text-muted-foreground hover:text-primary"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+            )}
             <p className="text-xs text-muted-foreground">
               {totalUnitsInSubAccount} producto(s) en {currentSubAccount?.label ?? "Cuenta 1"}
               {promoLinesCount > 0 && (
@@ -496,12 +700,23 @@ export function TablesPosView({
               )}
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1.5">
+            {canEdit && (
+              <button
+                type="button"
+                title="Agregar cobro adicional (vaso roto, descorche, servicio...)"
+                onClick={() => void handleOpenQuickExtraCharge()}
+                className="press-response flex min-h-10 items-center gap-1 rounded-xl bg-accent/15 px-2.5 text-xs font-bold text-accent ring-1 ring-accent/30"
+              >
+                <PlusCircle className="h-3.5 w-3.5" />
+                Adicional
+              </button>
+            )}
             {canEdit && store.featureFlags.enableSplitAccounts && (
               <button
                 type="button"
                 onClick={handleSplitAccount}
-                className="press-response flex min-h-10 items-center gap-1 rounded-xl bg-secondary px-3 text-xs font-bold text-primary"
+                className="press-response flex min-h-10 items-center gap-1 rounded-xl bg-secondary px-2.5 text-xs font-bold text-primary"
               >
                 <Plus className="h-4 w-4" />
                 Dividir
@@ -559,10 +774,28 @@ export function TablesPosView({
                           setSelectedSubAccountId(sa.id);
                         }
                       }}
-                      className="press-response flex min-h-10 items-center pl-3 pr-2 text-xs font-bold"
+                      className="press-response flex min-h-10 items-center pl-3 pr-1.5 text-xs font-bold"
                     >
                       {isMoveTarget ? `→ Mover a ${sa.label}` : sa.label}
                     </button>
+                    {canEdit && !isMoveTarget && (
+                      <button
+                        type="button"
+                        title={`Editar etiqueta y descripción de ${sa.label}`}
+                        aria-label={`Editar etiqueta de ${sa.label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleOpenEditSubAccount(sa);
+                        }}
+                        className={`press-response flex h-7 w-7 items-center justify-center rounded-lg transition ${
+                          active
+                            ? "text-primary-foreground/80 hover:bg-black/15 hover:text-primary-foreground"
+                            : "text-muted-foreground hover:bg-primary/20 hover:text-primary"
+                        }`}
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                    )}
                     {canEdit && !isMoveTarget && (
                       <button
                         type="button"
@@ -615,6 +848,120 @@ export function TablesPosView({
             )}
           </div>
         )}
+
+        {/* Etiqueta / descripción visible de la cuenta activa + acceso rápido a editar */}
+        {currentSubAccount && subAccountEditorMode === "closed" && (
+          <div className="mt-2 flex items-center justify-between gap-2 rounded-xl bg-background/50 px-2.5 py-1.5 text-[11px]">
+            <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+              <Tag className="h-3.5 w-3.5 shrink-0 text-primary" />
+              {currentSubAccount.description ? (
+                <span className="truncate text-foreground">
+                  <strong className="text-primary">{currentSubAccount.label}:</strong>{" "}
+                  {currentSubAccount.description}
+                </span>
+              ) : (
+                <span className="truncate">
+                  Sin descripción en <strong className="text-foreground">{currentSubAccount.label}</strong>
+                </span>
+              )}
+            </div>
+            {canEdit && (
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => handleOpenEditSubAccount(currentSubAccount)}
+                  className="press-response rounded-lg bg-secondary px-2 py-0.5 text-[10px] font-bold text-primary"
+                >
+                  {currentSubAccount.description ? "Editar" : "+ Etiqueta / Nota"}
+                </button>
+                {currentSubAccount.description && (
+                  <button
+                    type="button"
+                    title="Quitar descripción"
+                    onClick={() =>
+                      void store.updateSubAccount(currentSubAccount.id, { description: null })
+                    }
+                    className="press-response flex h-5 w-5 items-center justify-center rounded-md bg-secondary text-muted-foreground hover:text-destructive"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Editor en línea para añadir o editar etiqueta + descripción de cuenta */}
+        {canEdit && subAccountEditorMode !== "closed" && (
+          <div className="mt-2.5 space-y-2 rounded-xl border border-primary/40 bg-primary/8 p-2.5 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-primary">
+                {subAccountEditorMode === "create"
+                  ? "Nueva cuenta con etiqueta"
+                  : "Editar etiqueta y descripción"}
+              </span>
+              <button
+                type="button"
+                onClick={() => setSubAccountEditorMode("closed")}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="grid gap-1.5 sm:grid-cols-2">
+              <input
+                type="text"
+                autoFocus
+                maxLength={60}
+                placeholder="Nombre / Etiqueta (ej. Camilo, Chicas barra)"
+                value={subLabelDraft}
+                onChange={(e) => setSubLabelDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleSaveSubAccountEditor();
+                  } else if (e.key === "Escape") {
+                    setSubAccountEditorMode("closed");
+                  }
+                }}
+                className="rounded-lg border border-white/15 bg-background px-2.5 py-1.5 text-xs font-bold text-foreground focus:border-primary focus:outline-none"
+              />
+              <input
+                type="text"
+                maxLength={140}
+                placeholder="Descripción opcional (ej. Camisa negra, paga aparte)"
+                value={subDescDraft}
+                onChange={(e) => setSubDescDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleSaveSubAccountEditor();
+                  } else if (e.key === "Escape") {
+                    setSubAccountEditorMode("closed");
+                  }
+                }}
+                className="rounded-lg border border-white/15 bg-background px-2.5 py-1.5 text-xs text-foreground focus:border-primary focus:outline-none"
+              />
+            </div>
+            <div className="flex justify-end gap-1.5">
+              <button
+                type="button"
+                onClick={() => setSubAccountEditorMode("closed")}
+                className="rounded-lg bg-secondary px-3 py-1.5 text-[11px] font-semibold text-muted-foreground"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSaveSubAccountEditor()}
+                className="press-response flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-[11px] font-bold text-primary-foreground"
+              >
+                <Check className="h-3.5 w-3.5" />
+                {subAccountEditorMode === "create" ? "Crear Cuenta" : "Guardar"}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3.5">
@@ -648,8 +995,17 @@ export function TablesPosView({
                       {item.quantity}× {item.productNameSnap}
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      {item.presentationNameSnap}
-                      {item.allyIdSnap ? " · Aliado" : ""}
+                      {!item.presentationId ? (
+                        <span className="inline-flex items-center gap-1 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-bold text-accent">
+                          <PlusCircle className="h-2.5 w-2.5" />
+                          {item.presentationNameSnap}
+                        </span>
+                      ) : (
+                        <>
+                          {item.presentationNameSnap}
+                          {item.allyIdSnap ? " · Aliado" : ""}
+                        </>
+                      )}
                     </p>
                     {item.discountAmount > 0 && (
                       <span className="mt-1 inline-flex items-center gap-1 rounded-md bg-success/15 px-1.5 py-0.5 text-[11px] font-bold text-success">
@@ -737,6 +1093,7 @@ export function TablesPosView({
             if (!canEdit) return;
             haptics.tap();
             setShowMobileOrderSheet(false);
+            setCheckoutInitialMode("pay");
             setShowCheckout(true);
           }}
           className="press-response flex min-h-14 w-full items-center justify-center gap-2 rounded-2xl bg-primary text-base font-bold text-primary-foreground disabled:opacity-40"
@@ -943,6 +1300,32 @@ export function TablesPosView({
           <span>
             Modo solo vista: puedes consultar mesas, carta y cuentas sin modificar pedidos ni cobrar.
           </span>
+        </div>
+      )}
+
+      {/* Bloqueo de ventas si no hay apertura de caja activa (< 24h) */}
+      {canEdit && posBlockedByShift && (
+        <div className="mx-3 mt-2 flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-2xl border border-destructive/45 bg-destructive/12 px-4 py-2.5 text-xs lg:mx-0 lg:mb-3 lg:mt-0">
+          <div className="flex items-center gap-2 text-destructive">
+            <Lock className="h-4 w-4 shrink-0" />
+            <span className="font-bold">
+              {shiftExpired24h
+                ? `Turno abierto hace ${store.activeShift?.hoursOpen ?? 24}h (>24h): cierra caja y abre nuevo turno para vender.`
+                : "Caja cerrada: realiza la apertura de caja del día para habilitar ventas en el POS."}
+            </span>
+          </div>
+          {onGoToCash && (
+            <button
+              type="button"
+              onClick={() => {
+                haptics.tap();
+                onGoToCash();
+              }}
+              className="press-response rounded-xl bg-destructive px-3.5 py-1.5 text-xs font-bold text-white"
+            >
+              {shiftExpired24h ? "Cerrar / Abrir Caja" : "Abrir Caja Ahora"}
+            </button>
+          )}
         </div>
       )}
 
@@ -1250,6 +1633,86 @@ export function TablesPosView({
                                   })}
                                 </div>
                               )}
+
+                              {/* Combos unificados (aliado y/o alimento de la casa) para productos de 1 presentación */}
+                              {!disabled && (() => {
+                                const singleCombos = getMatchingComboTemplatesForPresentation({
+                                  product,
+                                  presentation,
+                                  comboTemplates: store.comboTemplates,
+                                  alliesById: alliesMap,
+                                  inventoryById: inventoryMap,
+                                  presentationMaxServings: availability.maxServings,
+                                  isoDayOfWeek: isoDay,
+                                  currentTimeHHMM: hhmm,
+                                  currentDateYYYYMMDD: yyyymmdd,
+                                  autoHideClosedAllies: store.featureFlags.autoHideClosedAllies,
+                                });
+                                if (singleCombos.length === 0) return null;
+                                return (
+                                  <div className="space-y-1.5 border-t border-white/10 pt-2">
+                                    {singleCombos.map((offer) => {
+                                      const baseQty = Math.max(1, offer.template.baseQuantity ?? 1);
+                                      const houseSummary =
+                                        offer.template.fixedRecipes && offer.template.fixedRecipes.length > 0
+                                          ? offer.template.fixedRecipes
+                                              .map((r) => `${r.displayQuantity} ${r.displayUnit} ${r.itemName ?? ""}`.trim())
+                                              .join(" + ")
+                                          : null;
+                                      return (
+                                        <button
+                                          key={`${presentation.id}:combo:${offer.template.id}`}
+                                          type="button"
+                                          disabled={!offer.canFulfill}
+                                          onClick={() => {
+                                            if (!offer.canFulfill) {
+                                              haptics.blocked();
+                                              return;
+                                            }
+                                            void handleTapPresentation(
+                                              product,
+                                              presentation,
+                                              1,
+                                              null,
+                                              offer.template,
+                                            );
+                                          }}
+                                          className={`press-response flex min-h-11 w-full items-center justify-between gap-2 rounded-xl border px-3 py-1.5 text-left transition ${
+                                            offer.canFulfill
+                                              ? "border-warning/40 bg-warning/10 hover:bg-warning/18"
+                                              : "cursor-not-allowed border-white/10 bg-secondary/40 opacity-50"
+                                          }`}
+                                        >
+                                          <div className="flex min-w-0 items-center gap-2">
+                                            <Layers className="h-3.5 w-3.5 shrink-0 text-warning" />
+                                            <div className="min-w-0">
+                                              <p className="truncate text-xs font-bold text-warning">
+                                                {baseQty > 1 ? `${baseQty}× ` : ""}
+                                                {presentation.shortLabel ?? presentation.name} +{" "}
+                                                {offer.template.shortLabel || offer.template.name}
+                                              </p>
+                                              <p className="truncate text-[10px] text-muted-foreground">
+                                                {!offer.canFulfill
+                                                  ? offer.insufficientReason ?? "Stock insuficiente"
+                                                  : [
+                                                      `Descuenta ${product.name}`,
+                                                      offer.allyName ? `Aliado: ${offer.allyName}` : null,
+                                                      houseSummary ? `Casa: ${houseSummary}` : null,
+                                                    ]
+                                                      .filter(Boolean)
+                                                      .join(" · ")}
+                                              </p>
+                                            </div>
+                                          </div>
+                                          <span className="shrink-0 text-xs font-bold tabular-nums text-warning">
+                                            {offer.canFulfill ? formatCOP(offer.finalPrice) : "Agotado"}
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                );
+                              })()}
                             </div>
                           );
                         })()
@@ -1327,6 +1790,90 @@ export function TablesPosView({
                               },
                             )}
                           </div>
+
+                          {/* Combos unificados por categoría o producto (aliado y/o alimento de la casa) */}
+                          {(() => {
+                            const comboRows = entries.flatMap((entry) =>
+                              entry.availability.available
+                                ? getMatchingComboTemplatesForPresentation({
+                                    product,
+                                    presentation: entry.presentation,
+                                    comboTemplates: store.comboTemplates,
+                                    alliesById: alliesMap,
+                                    inventoryById: inventoryMap,
+                                    presentationMaxServings: entry.availability.maxServings,
+                                    isoDayOfWeek: isoDay,
+                                    currentTimeHHMM: hhmm,
+                                    currentDateYYYYMMDD: yyyymmdd,
+                                    autoHideClosedAllies: store.featureFlags.autoHideClosedAllies,
+                                  }).map((offer) => ({ entry, offer }))
+                                : [],
+                            );
+                            if (comboRows.length === 0) return null;
+                            return (
+                              <div className="space-y-1.5 border-t border-white/10 pt-2">
+                                {comboRows.map(({ entry, offer }) => {
+                                  const baseQty = Math.max(1, offer.template.baseQuantity ?? 1);
+                                  const houseSummary =
+                                    offer.template.fixedRecipes && offer.template.fixedRecipes.length > 0
+                                      ? offer.template.fixedRecipes
+                                          .map((r) => `${r.displayQuantity} ${r.displayUnit} ${r.itemName ?? ""}`.trim())
+                                          .join(" + ")
+                                      : null;
+                                  return (
+                                    <button
+                                      key={`${entry.presentation.id}:combo:${offer.template.id}`}
+                                      type="button"
+                                      disabled={!offer.canFulfill}
+                                      onClick={() => {
+                                        if (!offer.canFulfill) {
+                                          haptics.blocked();
+                                          return;
+                                        }
+                                        void handleTapPresentation(
+                                          product,
+                                          entry.presentation,
+                                          1,
+                                          null,
+                                          offer.template,
+                                        );
+                                      }}
+                                      className={`press-response flex min-h-11 w-full items-center justify-between gap-2 rounded-xl border px-3 py-1.5 text-left transition ${
+                                        offer.canFulfill
+                                          ? "border-warning/40 bg-warning/10 hover:bg-warning/18"
+                                          : "cursor-not-allowed border-white/10 bg-secondary/40 opacity-50"
+                                      }`}
+                                    >
+                                      <div className="flex min-w-0 items-center gap-2">
+                                        <Layers className="h-3.5 w-3.5 shrink-0 text-warning" />
+                                        <div className="min-w-0">
+                                          <p className="truncate text-xs font-bold text-warning">
+                                            {baseQty > 1 ? `${baseQty}× ` : ""}
+                                            {entry.presentation.shortLabel ?? entry.presentation.name} +{" "}
+                                            {offer.template.shortLabel || offer.template.name}
+                                          </p>
+                                          <p className="truncate text-[10px] text-muted-foreground">
+                                            {!offer.canFulfill
+                                              ? offer.insufficientReason ?? "Stock insuficiente"
+                                              : [
+                                                  `Descuenta ${product.name}`,
+                                                  offer.allyName ? `Aliado: ${offer.allyName}` : null,
+                                                  houseSummary ? `Casa: ${houseSummary}` : null,
+                                                ]
+                                                  .filter(Boolean)
+                                                  .join(" · ")}
+                                          </p>
+                                        </div>
+                                      </div>
+                                      <span className="shrink-0 text-xs font-bold tabular-nums text-warning">
+                                        {offer.canFulfill ? formatCOP(offer.finalPrice) : "Agotado"}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })()}
 
                           {/* Accesos rápidos de Promoción 1 toque para presentaciones de este producto */}
                           {(() => {
@@ -1576,7 +2123,7 @@ export function TablesPosView({
         </div>
       )}
 
-      {/* Modal Cobro & Fiado & Cortesías */}
+      {/* Modal Cobro & Fiado & Cortesías & Adicionales */}
       {showCheckout && currentSubAccount && (
         <CheckoutModal
           tableLabel={currentTableLabel}
@@ -1587,6 +2134,7 @@ export function TablesPosView({
           promotionRules={store.promotionRules}
           enableCredit={store.featureFlags.enableCreditAccounts}
           isAdmin={isAdmin}
+          initialMode={checkoutInitialMode}
           onQuickAddWhitelistCustomer={async (input) => {
             const branchId = store.branch?.id;
             if (!branchId) throw new Error("Sucursal no cargada");
@@ -1636,6 +2184,14 @@ export function TablesPosView({
           }}
           onAdjustItemPrice={async (itemId, newLineTotal, reason) => {
             await store.adjustOrderItemPrice(itemId, newLineTotal, reason);
+          }}
+          onAddCustomCharge={async (input) => {
+            await store.addCustomCharge(currentSubAccount.id, input);
+            toast({
+              kind: "success",
+              title: "Cargo adicional agregado",
+              description: `${input.description} (+${formatCOP(input.amount * (input.quantity ?? 1))})`,
+            });
           }}
           onApplyManualPromo={async (rule) => {
             await store.applyPromotionToSubAccount(currentSubAccount.id, rule);

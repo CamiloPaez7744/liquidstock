@@ -7,13 +7,17 @@ import {
   Eye,
   EyeOff,
   History,
+  ImagePlus,
+  Layers,
   LayoutGrid,
   List,
   Martini,
   MinusCircle,
+  Package,
   PackagePlus,
   Plus,
   RefreshCw,
+  Scale,
   Search,
   Tag,
   X,
@@ -25,12 +29,16 @@ import { useFeedback } from "../../shared/components/FeedbackProvider.js";
 import { InventoryItemTypeIcon } from "../../shared/components/ProductTypeIcon.js";
 import { formatBaseQuantity, formatHumanStock } from "../../shared/lib/format.js";
 import { haptics } from "../../shared/lib/haptics.js";
+import { CatalogPricesTab } from "./CatalogPricesTab.js";
+import { CentralizedCombosTab } from "./CentralizedCombosTab.js";
 import { ComposedRecipeModal } from "./ComposedRecipeModal.js";
 import { NewInventoryItemModal } from "./NewInventoryItemModal.js";
+import { ReconcileStockModal } from "./ReconcileStockModal.js";
 
 type StoreType = ReturnType<typeof useLiquiStock>;
 type StockFilter = "all" | "low" | "seasonal" | "keg" | "ml" | "g" | "unit";
 type ViewMode = "list" | "cards";
+type StockTab = "inventory" | "catalog" | "combos";
 
 const EDITION_TAG_PRESETS = ["", "Temporada", "Edición Limitada", "Nueva", "Recomendada"] as const;
 
@@ -52,12 +60,16 @@ export function InventoryView({
   store,
   branchId,
   isAdmin,
+  isBranchAdmin = false,
 }: {
   store: StoreType;
   branchId: string;
   isAdmin: boolean;
+  isBranchAdmin?: boolean;
 }) {
   const { toast } = useFeedback();
+  const [activeTab, setActiveTab] = useState<StockTab>("inventory");
+  const [showReconcileModal, setShowReconcileModal] = useState(false);
   const [ledger, setLedger] = useState<LedgerEntryRow[]>([]);
   const [ledgerTotal, setLedgerTotal] = useState(0);
   const [ledgerHasMore, setLedgerHasMore] = useState(false);
@@ -76,6 +88,10 @@ export function InventoryView({
   const [units, setUnits] = useState("1");
   const [freeQuantity, setFreeQuantity] = useState("1");
   const [cost, setCost] = useState("0");
+  const [purchasePayStatus, setPurchasePayStatus] = useState<"paid" | "pending" | "partial" | "none">("paid");
+  const [purchasePayMethodId, setPurchasePayMethodId] = useState("");
+  const [purchasePaidAmount, setPurchasePaidAmount] = useState("");
+  const [purchaseSupplierName, setPurchaseSupplierName] = useState("");
   const [wasteQty, setWasteQty] = useState("500");
   const [wasteReason, setWasteReason] = useState("Purga de línea / espuma excesiva");
   const [saving, setSaving] = useState(false);
@@ -492,6 +508,22 @@ export function InventoryView({
     if (!activeItem || saving || previewAddedBase <= 0) return;
     setSaving(true);
     try {
+      const treasuryList =
+        store.treasuryAccounts.length > 0 ? store.treasuryAccounts : store.paymentMethods;
+      const financePayload =
+        Number(cost) > 0 && purchasePayStatus !== "none"
+          ? {
+              paymentStatus: purchasePayStatus,
+              paymentMethodId:
+                purchasePayStatus === "paid" || purchasePayStatus === "partial"
+                  ? purchasePayMethodId || treasuryList[0]?.id || undefined
+                  : undefined,
+              paidAmount:
+                purchasePayStatus === "partial" ? Number(purchasePaidAmount) || 0 : undefined,
+              supplierName: purchaseSupplierName.trim() || undefined,
+            }
+          : { paymentStatus: "none" };
+
       await apiFetch(`/api/v1/branches/${branchId}/inventory/movements`, {
         method: "POST",
         body: JSON.stringify(
@@ -503,6 +535,7 @@ export function InventoryView({
                 totalCost: Number(cost) || 0,
                 reason: `Compra directa (${formatBaseQuantity(previewAddedBase, activeItem.baseUnit)})`,
                 userId: store.activeUserId,
+                ...financePayload,
               }
             : {
                 inventoryItemId: activeItem.id,
@@ -512,11 +545,38 @@ export function InventoryView({
                 totalCost: Number(cost) || 0,
                 reason: `Compra ${units}x ${activePres.name}`,
                 userId: store.activeUserId,
+                ...financePayload,
               },
         ),
       });
       haptics.success();
+      setPurchasePaidAmount("");
+      setPurchaseSupplierName("");
       await Promise.all([store.refresh(), loadLedger()]);
+      const chosenAccName =
+        (store.treasuryAccounts.length > 0 ? store.treasuryAccounts : store.paymentMethods).find(
+          (a) => a.id === (purchasePayMethodId || store.treasuryAccounts[0]?.id || store.paymentMethods[0]?.id),
+        )?.name ?? "Cuenta";
+      const financeNote =
+        Number(cost) <= 0 || purchasePayStatus === "none"
+          ? "Solo inventario (sin movimiento financiero)."
+          : purchasePayStatus === "paid"
+            ? `Egreso registrado en ${chosenAccName}.`
+            : purchasePayStatus === "pending"
+              ? `Registrado como fiado por pagar a ${purchaseSupplierName.trim() || "proveedor"}.`
+              : `Abono registrado en ${chosenAccName} y saldo en cuentas por pagar.`;
+      toast({
+        kind: "success",
+        title: `Stock sumado: +${formatBaseQuantity(previewAddedBase, activeItem.baseUnit)}`,
+        description: `${activeItem.name} · ${financeNote}`,
+      });
+    } catch (err) {
+      haptics.blocked();
+      toast({
+        kind: "error",
+        title: "No se pudo registrar la compra",
+        description: err instanceof Error ? err.message : "Error de conexión",
+      });
     } finally {
       setSaving(false);
     }
@@ -562,6 +622,30 @@ export function InventoryView({
       });
       haptics.tap();
       await Promise.all([store.refresh(), loadLedger()]);
+      const chosenAccName =
+        (store.treasuryAccounts.length > 0 ? store.treasuryAccounts : store.paymentMethods).find(
+          (a) => a.id === (purchasePayMethodId || store.treasuryAccounts[0]?.id || store.paymentMethods[0]?.id),
+        )?.name ?? "Cuenta";
+      const financeNote =
+        Number(cost) <= 0 || purchasePayStatus === "none"
+          ? "Solo inventario (sin movimiento financiero)."
+          : purchasePayStatus === "paid"
+            ? `Egreso registrado en ${chosenAccName}.`
+            : purchasePayStatus === "pending"
+              ? `Registrado como fiado por pagar a ${purchaseSupplierName.trim() || "proveedor"}.`
+              : `Abono registrado en ${chosenAccName} y saldo en cuentas por pagar.`;
+      toast({
+        kind: "success",
+        title: `Stock sumado: +${formatBaseQuantity(previewAddedBase, activeItem.baseUnit)}`,
+        description: `${activeItem.name} · ${financeNote}`,
+      });
+    } catch (err) {
+      haptics.blocked();
+      toast({
+        kind: "error",
+        title: "No se pudo registrar la compra",
+        description: err instanceof Error ? err.message : "Error de conexión",
+      });
     } finally {
       setSaving(false);
     }
@@ -603,15 +687,31 @@ export function InventoryView({
               </p>
             </div>
           </div>
-          {inMobileSheet && (
-            <button
-              type="button"
-              onClick={() => setMobileDetailOpen(false)}
-              className="press-response flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-secondary"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          )}
+          <div className="flex shrink-0 items-center gap-1.5">
+            {isBranchAdmin && (
+              <button
+                type="button"
+                onClick={() => {
+                  haptics.tap();
+                  setShowReconcileModal(true);
+                }}
+                title="Corregir stock físico real (requiere contraseña de Administrador)"
+                className="press-response flex min-h-9 items-center gap-1.5 rounded-xl border border-warning/40 bg-warning/15 px-3 text-xs font-bold text-warning"
+              >
+                <Scale className="h-3.5 w-3.5" />
+                Corregir Stock
+              </button>
+            )}
+            {inMobileSheet && (
+              <button
+                type="button"
+                onClick={() => setMobileDetailOpen(false)}
+                className="press-response flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-secondary"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Control rápido de visibilidad en POS y etiqueta Temporada / Edición Limitada */}
@@ -913,6 +1013,87 @@ export function InventoryView({
             </div>
           </div>
 
+          {/* Medio de pago / Fiado siempre visible al ingresar compra */}
+          <div className="space-y-2 rounded-xl border border-primary/25 bg-primary/5 p-3 text-xs">
+            <p className="font-bold text-primary">
+              Pago de la compra (se registra en Ingresos y Egresos / Proveedores)
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {(
+                [
+                  { id: "paid", label: "Pagado" },
+                  { id: "pending", label: "Pendiente (fiado)" },
+                  { id: "partial", label: "Pago parcial" },
+                  { id: "none", label: "Solo stock" },
+                ] as const
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setPurchasePayStatus(opt.id)}
+                  className={`press-response rounded-lg border px-2.5 py-1 text-[11px] font-bold ${
+                    purchasePayStatus === opt.id
+                      ? "border-primary bg-primary/20 text-primary"
+                      : "border-white/10 bg-background/70 text-muted-foreground"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            {purchasePayStatus !== "none" && (
+              <>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  {(purchasePayStatus === "paid" || purchasePayStatus === "partial") && (
+                    <select
+                      value={
+                        purchasePayMethodId ||
+                        (store.treasuryAccounts[0]?.id ?? store.paymentMethods[0]?.id ?? "")
+                      }
+                      onChange={(e) => setPurchasePayMethodId(e.target.value)}
+                      className="rounded-xl border border-white/15 bg-background px-2.5 py-2 text-xs"
+                    >
+                      {(store.treasuryAccounts.length > 0
+                        ? store.treasuryAccounts
+                        : store.paymentMethods
+                      ).map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          Sale de: {acc.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {purchasePayStatus === "partial" && (
+                    <input
+                      type="number"
+                      min={0}
+                      placeholder="Abono inicial (COP)"
+                      value={purchasePaidAmount}
+                      onChange={(e) => setPurchasePaidAmount(e.target.value)}
+                      className="rounded-xl border border-white/15 bg-background px-2.5 py-2 text-xs font-bold tabular-nums"
+                    />
+                  )}
+                  <input
+                    type="text"
+                    placeholder={
+                      purchasePayStatus === "paid"
+                        ? "Proveedor (opcional)"
+                        : "Nombre proveedor *"
+                    }
+                    value={purchaseSupplierName}
+                    onChange={(e) => setPurchaseSupplierName(e.target.value)}
+                    className="rounded-xl border border-white/15 bg-background px-2.5 py-2 text-xs"
+                  />
+                </div>
+                {!(Number(cost) > 0) && (
+                  <p className="text-[11px] font-medium text-warning">
+                    Ingresa el costo total de la factura arriba (mayor a $0) para que se registre en Ingresos y Egresos / Proveedores.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+
           {previewAddedBase > 0 && (
             <p className="rounded-xl bg-success/10 px-3 py-1.5 text-xs font-semibold tabular-nums text-success">
               Sumará +{formatBaseQuantity(previewAddedBase, activeItem.baseUnit)} → Nuevo stock:{" "}
@@ -977,36 +1158,86 @@ export function InventoryView({
     );
   };
 
+  const totalCombosCount =
+    store.comboTemplates.length +
+    store.menuProducts.filter(
+      (p) => p.productKind === "combo" || p.productKind === "third_party_ally",
+    ).length;
+
   return (
     <div className="space-y-4">
-      {/* Cabecera */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="font-display text-lg font-bold">Stock, Barriles e Inventario en Vivo</h2>
+      {/* Cabecera unificada con 3 tabs: Inventario | Carta y Precios | Combos */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5">
         <div className="flex flex-wrap items-center gap-2">
+          <h2 className="font-display text-lg font-bold">Stock y Carta</h2>
+          <div className="flex rounded-2xl border border-white/10 bg-secondary/60 p-1">
+            {(
+              [
+                { id: "inventory", label: "Inventario", icon: Package, count: store.inventoryItems.length },
+                { id: "catalog", label: "Carta y Precios", icon: ImagePlus, count: store.menuProducts.length },
+                { id: "combos", label: "Combos", icon: Layers, count: totalCombosCount },
+              ] as const
+            ).map(({ id, label, icon: TabIcon, count }) => {
+              const active = activeTab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => {
+                    haptics.tap();
+                    setActiveTab(id);
+                  }}
+                  className={`press-response flex min-h-9 items-center gap-1.5 rounded-xl px-3 text-xs font-bold transition ${
+                    active
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <TabIcon className="h-3.5 w-3.5" />
+                  <span>{label}</span>
+                  <span
+                    className={`rounded-full px-1.5 py-0.5 text-[10px] tabular-nums ${
+                      active ? "bg-black/20 text-primary-foreground" : "bg-background/70 text-muted-foreground"
+                    }`}
+                  >
+                    {count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {activeTab === "inventory" && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  haptics.tap();
+                  setShowNewModal(true);
+                }}
+                className="press-response flex min-h-10 items-center gap-1.5 rounded-xl bg-primary px-3.5 text-xs font-bold text-primary-foreground"
+              >
+                <Plus className="h-4 w-4" />
+                Nuevo Insumo / Producto
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  haptics.tap();
+                  setShowComposedModal(true);
+                }}
+                className="press-response flex min-h-10 items-center gap-1.5 rounded-xl bg-accent/20 px-3.5 text-xs font-bold text-accent ring-1 ring-accent/35"
+              >
+                <Martini className="h-4 w-4" />
+                Cóctel / Café / Receta
+              </button>
+            </>
+          )}
           <button
             type="button"
-            onClick={() => {
-              haptics.tap();
-              setShowNewModal(true);
-            }}
-            className="press-response flex min-h-10 items-center gap-1.5 rounded-xl bg-primary px-3.5 text-xs font-bold text-primary-foreground"
-          >
-            <Plus className="h-4 w-4" />
-            Nuevo Insumo / Producto
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              haptics.tap();
-              setShowComposedModal(true);
-            }}
-            className="press-response flex min-h-10 items-center gap-1.5 rounded-xl bg-accent/20 px-3.5 text-xs font-bold text-accent ring-1 ring-accent/35"
-          >
-            <Martini className="h-4 w-4" />
-            Cóctel / Café / Receta
-          </button>
-          <button
-            type="button"
+            title="Actualizar datos"
             onClick={() => void Promise.all([store.refresh(), loadLedger()])}
             className="press-response flex min-h-10 items-center gap-1.5 rounded-xl bg-secondary px-3 text-xs font-semibold"
           >
@@ -1015,6 +1246,12 @@ export function InventoryView({
         </div>
       </div>
 
+      {activeTab === "catalog" ? (
+        <CatalogPricesTab store={store} branchId={branchId} />
+      ) : activeTab === "combos" ? (
+        <CentralizedCombosTab store={store} branchId={branchId} />
+      ) : (
+        <>
       {store.inventoryItems.length === 0 ? (
         <div className="solid-card flex flex-col items-center justify-center gap-3 rounded-2xl p-8 text-center">
           <Beer className="h-10 w-10 text-primary" />
@@ -1437,6 +1674,9 @@ export function InventoryView({
           branchId={branchId}
           userId={store.activeUserId}
           categories={store.categories}
+          treasuryAccounts={
+            store.treasuryAccounts.length > 0 ? store.treasuryAccounts : store.paymentMethods
+          }
           onClose={() => setShowNewModal(false)}
           onCreated={async (createdItemId) => {
             await Promise.all([store.refresh(), loadLedger()]);
@@ -1458,6 +1698,24 @@ export function InventoryView({
             await Promise.all([store.refresh(), loadLedger()]);
           }}
         />
+      )}
+
+      {showReconcileModal && activeItem && isBranchAdmin && (
+        <ReconcileStockModal
+          branchId={branchId}
+          item={activeItem}
+          onClose={() => setShowReconcileModal(false)}
+          onReconciled={async (res) => {
+            await Promise.all([store.refresh(), loadLedger()]);
+            toast({
+              kind: "success",
+              title: "Stock cuadrado y auditado",
+              description: `${activeItem.name}: ${formatBaseQuantity(res.previousStockBase, activeItem.baseUnit)} → ${formatBaseQuantity(res.nextStockBase, activeItem.baseUnit)} (${res.deltaBase >= 0 ? "+" : ""}${formatBaseQuantity(res.deltaBase, activeItem.baseUnit)})`,
+            });
+          }}
+        />
+      )}
+        </>
       )}
     </div>
   );

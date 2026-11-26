@@ -3,9 +3,14 @@ import {
   DEFAULT_BRANCH_FEATURE_FLAGS,
   resolveBranchRolePermissions,
   type BranchRolePermissions,
+  type OperatingScheduleSlot,
 } from "@liquistock/domain";
 import { requireAuth, requireBranchRole } from "../../../infrastructure/auth/auth-guard.js";
 import { db } from "../../../infrastructure/db/pool.js";
+import {
+  ensureBranchVaultAccount,
+  getBranchOpenShiftStatus,
+} from "../../../infrastructure/db/treasury.js";
 
 export async function registerBootstrapRoutes(app: FastifyInstance) {
   app.get("/api/v1/branches", async (request, reply) => {
@@ -41,11 +46,13 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       timezone: string;
       featureFlags: Record<string, boolean> | null;
       rolePermissions: Partial<BranchRolePermissions> | null;
+      operatingSchedules: OperatingScheduleSlot[] | null;
       isActive: boolean;
     }>(
       `SELECT id, organization_id AS "organizationId", name, code, timezone,
               feature_flags AS "featureFlags",
               role_permissions AS "rolePermissions",
+              operating_schedules AS "operatingSchedules",
               is_active AS "isActive"
        FROM branches WHERE id = $1`,
       [branchId],
@@ -55,6 +62,8 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
     if (!branch) {
       return reply.status(404).send({ error: "BRANCH_NOT_FOUND" });
     }
+
+    await ensureBranchVaultAccount(branchId);
 
     const [
       usersRes,
@@ -69,7 +78,8 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       customersRes,
       paymentMethodsRes,
       promotionsRes,
-      shiftRes,
+      comboTemplatesRes,
+      shiftStatus,
       sessionsRes,
       subAccountsRes,
       orderItemsRes,
@@ -147,6 +157,7 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
                 operating_days AS "operatingDays",
                 to_char(open_time, 'HH24:MI') AS "openTime",
                 to_char(close_time, 'HH24:MI') AS "closeTime",
+                operating_schedules AS "operatingSchedules",
                 is_temporarily_closed AS "isTemporarilyClosed",
                 is_active AS "isActive"
          FROM allies WHERE branch_id = $1 AND is_active = true ORDER BY name ASC`,
@@ -164,6 +175,7 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       db.query(
         `SELECT id, branch_id AS "branchId", name, code,
                 counts_as_physical_cash AS "countsAsPhysicalCash",
+                is_internal_vault AS "isInternalVault",
                 sort_order AS "sortOrder", is_active AS "isActive"
          FROM payment_methods WHERE branch_id = $1 AND is_active = true ORDER BY sort_order ASC`,
         [branchId],
@@ -181,11 +193,21 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
         [branchId],
       ),
       db.query(
-        `SELECT id, branch_id AS "branchId", status, opened_at AS "openedAt",
-                opening_float::float8 AS "openingFloat"
-         FROM cash_shifts WHERE branch_id = $1 AND status = 'open' LIMIT 1`,
+        `SELECT id, branch_id AS "branchId", name, short_label AS "shortLabel",
+                scope_type AS "scopeType", target_id AS "targetId",
+                presentation_group AS "presentationGroup",
+                base_quantity AS "baseQuantity",
+                companion_type AS "companionType",
+                pricing_mode AS "pricingMode",
+                price_value::float8 AS "priceValue",
+                ally_id AS "allyId",
+                ally_payout_amount::float8 AS "allyPayoutAmount",
+                COALESCE(fixed_recipes, '[]'::jsonb) AS "fixedRecipes",
+                is_active AS "isActive"
+         FROM combo_templates WHERE branch_id = $1 ORDER BY created_at ASC`,
         [branchId],
       ),
+      getBranchOpenShiftStatus(branchId),
       db.query(
         `SELECT id, branch_id AS "branchId", dining_table_id AS "diningTableId",
                 cash_shift_id AS "cashShiftId", status, opened_at AS "openedAt"
@@ -194,7 +216,7 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       ),
       db.query(
         `SELECT sa.id, sa.branch_id AS "branchId", sa.table_session_id AS "tableSessionId",
-                sa.label, sa.customer_id AS "customerId", sa.status,
+                sa.label, sa.description, sa.customer_id AS "customerId", sa.status,
                 sa.subtotal_amount::float8 AS "subtotalAmount",
                 sa.discount_amount::float8 AS "discountAmount",
                 sa.total_amount::float8 AS "totalAmount",
@@ -224,7 +246,7 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
          FROM order_items oi
          JOIN sub_accounts sa ON sa.id = oi.sub_account_id
          JOIN table_sessions ts ON ts.id = sa.table_session_id
-         JOIN menu_products mp ON mp.id = oi.menu_product_id
+         LEFT JOIN menu_products mp ON mp.id = oi.menu_product_id
          WHERE oi.branch_id = $1 AND ts.status = 'open' AND oi.status = 'active'
          ORDER BY oi.created_at ASC`,
         [branchId],
@@ -254,9 +276,13 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
         openTime: a.openTime ?? null,
         closeTime: a.closeTime ?? null,
       },
+      operatingSchedules: Array.isArray(a.operatingSchedules) ? a.operatingSchedules : [],
       isTemporarilyClosed: a.isTemporarilyClosed,
       isActive: a.isActive,
     }));
+
+    const allAccounts = paymentMethodsRes.rows as Array<{ isInternalVault?: boolean }>;
+    const posPaymentMethods = allAccounts.filter((pm) => !pm.isInternalVault);
 
     return {
       serverTime: new Date().toISOString(),
@@ -267,10 +293,18 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
           ...(branch.featureFlags ?? {}),
         },
         rolePermissions: resolveBranchRolePermissions(branch.rolePermissions),
+        operatingSchedules: Array.isArray(branch.operatingSchedules) ? branch.operatingSchedules : [],
       },
       users: usersRes.rows,
       diningTables: tablesRes.rows,
-      activeShift: shiftRes.rows[0] ?? null,
+      activeShift: shiftStatus.shift
+        ? {
+            ...shiftStatus.shift,
+            hoursOpen: shiftStatus.hoursOpen,
+            isExpired24h: shiftStatus.isExpired24h,
+          }
+        : null,
+      lastClosedCashLeft: shiftStatus.lastClosedCashLeft,
       categories: categoriesRes.rows,
       menuProducts: productsRes.rows,
       presentations,
@@ -278,8 +312,10 @@ export async function registerBootstrapRoutes(app: FastifyInstance) {
       purchasePresentations: purchasePresRes.rows,
       allies,
       customers: customersRes.rows,
-      paymentMethods: paymentMethodsRes.rows,
+      paymentMethods: posPaymentMethods,
+      treasuryAccounts: allAccounts,
       promotionRules: promotionsRes.rows,
+      comboTemplates: comboTemplatesRes.rows,
       openTableSessions: sessionsRes.rows,
       openSubAccounts: subAccountsRes.rows,
       openOrderItems: orderItemsRes.rows,

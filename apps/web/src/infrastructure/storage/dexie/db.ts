@@ -3,6 +3,7 @@ import {
   generateUuidV7,
   type Ally,
   type Branch,
+  type ComboTemplate,
   type Customer,
   type InventoryItem,
   type MenuCategory,
@@ -52,6 +53,7 @@ export interface LocalSubAccount {
   branchId: string;
   tableSessionId: string;
   label: string;
+  description?: string | null;
   customerId?: string | null;
   status: "open" | "paid" | "credit" | "partial_credit" | "voided";
   subtotalAmount: number;
@@ -80,7 +82,9 @@ export class LiquiStockLocalDb extends Dexie {
   allies!: Table<Ally, string>;
   customers!: Table<Customer, string>;
   paymentMethods!: Table<PaymentMethod, string>;
+  treasuryAccounts!: Table<PaymentMethod, string>;
   promotionRules!: Table<PromotionRule, string>;
+  comboTemplates!: Table<ComboTemplate, string>;
   tableSessions!: Table<LocalTableSession, string>;
   subAccounts!: Table<LocalSubAccount, string>;
   orderItems!: Table<OrderItemLine, string>;
@@ -102,6 +106,27 @@ export class LiquiStockLocalDb extends Dexie {
       customers: "id, branchId, creditStatus, fullName",
       paymentMethods: "id, branchId, sortOrder",
       promotionRules: "id, branchId, isActive, priority",
+      tableSessions: "id, branchId, diningTableId, status",
+      subAccounts: "id, branchId, tableSessionId, status",
+      orderItems: "id, subAccountId, status",
+      syncOutbox: "idempotencyKey, [branchId+syncStatus], syncStatus, createdAt",
+      syncMeta: "key",
+    });
+    this.version(3).stores({
+      branches: "id",
+      branchUsers: "id, role",
+      diningTables: "id, branchId, sortOrder",
+      categories: "id, branchId, sortOrder",
+      menuProducts: "id, branchId, categoryId, allyId, isAvailable",
+      presentations: "id, branchId, menuProductId, presentationGroup, allyId",
+      inventoryItems: "id, branchId, isKeg, isActive",
+      purchasePresentations: "id, inventoryItemId",
+      allies: "id, branchId, isActive",
+      customers: "id, branchId, creditStatus, fullName",
+      paymentMethods: "id, branchId, sortOrder",
+      treasuryAccounts: "id, branchId, sortOrder",
+      promotionRules: "id, branchId, isActive, priority",
+      comboTemplates: "id, branchId, isActive, scopeType, targetId",
       tableSessions: "id, branchId, diningTableId, status",
       subAccounts: "id, branchId, tableSessionId, status",
       orderItems: "id, subAccountId, status",

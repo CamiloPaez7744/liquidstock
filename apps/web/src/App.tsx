@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   BarChart3,
   Beer,
+  BookOpen,
   Building2,
   CloudOff,
   LogOut,
@@ -31,6 +32,7 @@ import { syncEngine, type SyncStatusSnapshot } from "./infrastructure/sync/sync-
 import { useLiquiStock } from "./infrastructure/sync/useLiquiStock.js";
 import { AuthScreen } from "./features/auth/AuthScreen.js";
 import { CashShiftView } from "./features/cash-shift/CashShiftView.js";
+import { FinanceLedgerView } from "./features/finance/FinanceLedgerView.js";
 import { InventoryView } from "./features/inventory/InventoryView.js";
 import { KpisView } from "./features/kpis/KpisView.js";
 import { BarConfigView } from "./features/settings/BarConfigView.js";
@@ -49,8 +51,9 @@ const NAV_ITEMS: Array<{
   icon: typeof Beer;
 }> = [
   { id: "pos", label: "Mesas & POS", shortLabel: "POS", icon: UtensilsCrossed },
-  { id: "inventory", label: "Stock", shortLabel: "Stock", icon: Beer },
-  { id: "cash", label: "Caja & Cierre", shortLabel: "Caja", icon: Receipt },
+  { id: "inventory", label: "Stock y Carta", shortLabel: "Stock", icon: Beer },
+  { id: "cash", label: "Caja & Turno", shortLabel: "Caja", icon: Receipt },
+  { id: "finance", label: "Ingresos y Egresos", shortLabel: "Finanzas", icon: BookOpen },
   { id: "kpis", label: "KPIs", shortLabel: "KPIs", icon: BarChart3 },
   { id: "settings", label: "Config Bar", shortLabel: "Config", icon: Settings2 },
   { id: "users", label: "Mi Bar & Equipo", shortLabel: "Mi Bar", icon: Users },
@@ -268,19 +271,28 @@ function AuthenticatedPosShell({
                   : undefined
               }
               onGoToInventory={() => setSection("inventory")}
+              onGoToCash={() => setSection("cash")}
             />
           ) : currentSection === "inventory" ? (
             <InventoryView
               store={store}
               branchId={activeBranchId}
               isAdmin={canEditModule("inventory")}
+              isBranchAdmin={isAdmin}
             />
           ) : currentSection === "cash" ? (
             <CashShiftView
               store={store}
               branchId={activeBranchId}
               canEdit={canEditModule("cash")}
+              canEditFinance={canEditModule("finance")}
               isAdmin={isAdmin}
+            />
+          ) : currentSection === "finance" ? (
+            <FinanceLedgerView
+              store={store}
+              branchId={activeBranchId}
+              canEdit={canEditModule("finance")}
             />
           ) : currentSection === "kpis" ? (
             <KpisView store={store} branchId={activeBranchId} />

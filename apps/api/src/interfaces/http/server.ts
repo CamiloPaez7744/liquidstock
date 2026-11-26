@@ -15,6 +15,7 @@ import {
   requireBranchModulePermission,
 } from "../../infrastructure/auth/auth-guard.js";
 import { closeDb, db, dbEngineLabel } from "../../infrastructure/db/pool.js";
+import { getBranchOpenShiftStatus } from "../../infrastructure/db/treasury.js";
 import { isCloudinaryConfigured } from "../../infrastructure/media/cloudinary.js";
 import { PostgresSyncRepository } from "../../infrastructure/db/postgres-sync.repository.js";
 import { branchHub } from "../../infrastructure/realtime/branch-hub.js";
@@ -37,8 +38,10 @@ const syncBatchSchema = z.object({
       commandType: z.enum([
         "OPEN_TABLE_SESSION",
         "CREATE_SUB_ACCOUNT",
+        "UPDATE_SUB_ACCOUNT",
         "DELETE_SUB_ACCOUNT",
         "ADD_ORDER_ITEM",
+        "ADD_CUSTOM_CHARGE",
         "VOID_ORDER_ITEM",
         "MOVE_ORDER_ITEM",
         "ADJUST_ORDER_ITEM_PRICE",
@@ -80,6 +83,115 @@ export async function buildServer() {
     );
     await db.query(
       `ALTER TABLE cash_shifts ADD COLUMN IF NOT EXISTS declared_by_method jsonb NOT NULL DEFAULT '{}'::jsonb`,
+    );
+    await db.query(`ALTER TABLE order_items ALTER COLUMN menu_product_id DROP NOT NULL`);
+    await db.query(`ALTER TABLE order_items ALTER COLUMN presentation_id DROP NOT NULL`);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS cash_extras (
+        id uuid PRIMARY KEY,
+        branch_id uuid NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        cash_shift_id uuid REFERENCES cash_shifts(id) ON DELETE SET NULL,
+        payment_method_id uuid NOT NULL REFERENCES payment_methods(id),
+        category text NOT NULL DEFAULT 'otro',
+        description text NOT NULL,
+        amount numeric(14,2) NOT NULL CHECK (amount > 0),
+        created_by uuid NOT NULL REFERENCES users(id),
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await db.query(
+      `CREATE INDEX IF NOT EXISTS idx_cash_extras_branch_created ON cash_extras (branch_id, created_at DESC)`,
+    );
+    await db.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS operational_go_live_at timestamptz`);
+    await db.query(`
+      CREATE OR REPLACE FUNCTION prevent_ledger_mutation()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+          IF TG_OP = 'DELETE' AND current_setting('liquistock.allow_superadmin_purge', true) = 'true' THEN
+              RETURN OLD;
+          END IF;
+          RAISE EXCEPTION 'Ledger table % is append-only; use a compensating entry instead.', TG_TABLE_NAME
+              USING ERRCODE = '42501';
+      END;
+      $$
+    `);
+    // Migration 009 idempotent evolution for live PGlite / PostgreSQL instances
+    await db.query(`ALTER TABLE payment_methods ADD COLUMN IF NOT EXISTS is_internal_vault boolean NOT NULL DEFAULT false`);
+    await db.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS operating_schedules jsonb NOT NULL DEFAULT '[]'::jsonb`);
+    await db.query(`ALTER TABLE allies ADD COLUMN IF NOT EXISTS operating_schedules jsonb NOT NULL DEFAULT '[]'::jsonb`);
+    await db.query(`ALTER TABLE cash_shifts ADD COLUMN IF NOT EXISTS expected_opening_float numeric(12,2) NOT NULL DEFAULT 0`);
+    await db.query(`ALTER TABLE cash_shifts ADD COLUMN IF NOT EXISTS opening_discrepancy numeric(12,2) NOT NULL DEFAULT 0`);
+    await db.query(`ALTER TABLE cash_shifts ADD COLUMN IF NOT EXISTS transfer_to_vault_amount numeric(12,2) NOT NULL DEFAULT 0`);
+    await db.query(`ALTER TABLE cash_shifts ADD COLUMN IF NOT EXISTS closing_cash_left numeric(12,2)`);
+    await db.query(`ALTER TABLE cash_expenses ADD COLUMN IF NOT EXISTS reference_type text`);
+    await db.query(`ALTER TABLE cash_expenses ADD COLUMN IF NOT EXISTS reference_id uuid`);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS cash_transfers (
+        id uuid PRIMARY KEY,
+        branch_id uuid NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        cash_shift_id uuid REFERENCES cash_shifts(id) ON DELETE SET NULL,
+        from_payment_method_id uuid NOT NULL REFERENCES payment_methods(id),
+        to_payment_method_id uuid NOT NULL REFERENCES payment_methods(id),
+        amount numeric(14,2) NOT NULL CHECK (amount > 0),
+        notes text,
+        created_by uuid NOT NULL REFERENCES users(id),
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS supplier_payables (
+        id uuid PRIMARY KEY,
+        branch_id uuid NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        supplier_name text NOT NULL,
+        description text NOT NULL,
+        inventory_item_id uuid REFERENCES inventory_items(id) ON DELETE SET NULL,
+        total_amount numeric(14,2) NOT NULL CHECK (total_amount > 0),
+        paid_amount numeric(14,2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0),
+        status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'partial', 'paid')),
+        created_by uuid NOT NULL REFERENCES users(id),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS supplier_payments (
+        id uuid PRIMARY KEY,
+        branch_id uuid NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        supplier_payable_id uuid NOT NULL REFERENCES supplier_payables(id) ON DELETE CASCADE,
+        payment_method_id uuid NOT NULL REFERENCES payment_methods(id),
+        cash_expense_id uuid REFERENCES cash_expenses(id) ON DELETE SET NULL,
+        amount numeric(14,2) NOT NULL CHECK (amount > 0),
+        notes text,
+        created_by uuid NOT NULL REFERENCES users(id),
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS combo_templates (
+        id uuid PRIMARY KEY,
+        branch_id uuid NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        name text NOT NULL,
+        short_label text,
+        scope_type text NOT NULL CHECK (scope_type IN ('category', 'product')),
+        target_id uuid NOT NULL,
+        presentation_group text NOT NULL,
+        pricing_mode text NOT NULL DEFAULT 'fixed_price' CHECK (pricing_mode IN ('fixed_price', 'add_on_price')),
+        price_value numeric(12,2) NOT NULL CHECK (price_value >= 0),
+        ally_id uuid REFERENCES allies(id) ON DELETE SET NULL,
+        ally_payout_amount numeric(12,2) NOT NULL DEFAULT 0 CHECK (ally_payout_amount >= 0),
+        is_active boolean NOT NULL DEFAULT true,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await db.query(`ALTER TABLE sub_accounts ADD COLUMN IF NOT EXISTS description text`);
+    await db.query(
+      `ALTER TABLE combo_templates ADD COLUMN IF NOT EXISTS base_quantity integer NOT NULL DEFAULT 1`,
+    );
+    await db.query(
+      `ALTER TABLE combo_templates ADD COLUMN IF NOT EXISTS companion_type text NOT NULL DEFAULT 'ally'`,
+    );
+    await db.query(
+      `ALTER TABLE combo_templates ADD COLUMN IF NOT EXISTS fixed_recipes jsonb NOT NULL DEFAULT '[]'::jsonb`,
     );
   } catch {
     // Table may not exist yet before migrations run in test harness
@@ -172,6 +284,31 @@ export async function buildServer() {
       "edit",
     );
     if (!auth) return;
+
+    // Enforce active cash shift (< 24h) before accepting new POS sales/orders
+    const saleCommands = new Set([
+      "OPEN_TABLE_SESSION",
+      "ADD_ORDER_ITEM",
+      "ADD_CUSTOM_CHARGE",
+      "RECORD_PAYMENT",
+      "CHARGE_SUB_ACCOUNT_CREDIT",
+    ]);
+    if (parsed.data.commands.some((c) => saleCommands.has(c.commandType))) {
+      const shiftStatus = await getBranchOpenShiftStatus(parsed.data.branchId);
+      if (!shiftStatus.shift) {
+        return reply.status(409).send({
+          error: "SHIFT_REQUIRED",
+          message: "Debes hacer la apertura de caja antes de iniciar ventas en el POS.",
+        });
+      }
+      if (shiftStatus.isExpired24h) {
+        return reply.status(409).send({
+          error: "SHIFT_EXPIRED_24H",
+          message:
+            "El turno abierto lleva más de 24 horas. Ciérralo y abre una nueva caja para continuar vendiendo.",
+        });
+      }
+    }
 
     // Enforce server-authenticated actor identity on every command
     const authenticatedCommands: OfflineSyncCommand[] = parsed.data.commands.map((c) => ({

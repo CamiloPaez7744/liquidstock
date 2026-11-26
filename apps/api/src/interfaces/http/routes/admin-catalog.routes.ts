@@ -29,6 +29,7 @@ const roleModulePermissionsPatchSchema = z
     pos: moduleAccessLevelSchema.optional(),
     inventory: moduleAccessLevelSchema.optional(),
     cash: moduleAccessLevelSchema.optional(),
+    finance: moduleAccessLevelSchema.optional(),
     kpis: moduleAccessLevelSchema.optional(),
     settings: moduleAccessLevelSchema.optional(),
     users: moduleAccessLevelSchema.optional(),
@@ -99,12 +100,22 @@ const presentationCreateSchema = z.object({
   recipes: z.array(recipeInputSchema).default([]),
 });
 
+const operatingScheduleSlotSchema = z.object({
+  daysOfWeek: z.array(z.number().int().min(1).max(7)).default([1, 2, 3, 4, 5, 6, 7]),
+  openTime: z.string().regex(/^\d{2}:\d{2}$/),
+  closeTime: z.string().regex(/^\d{2}:\d{2}$/),
+  validFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  validUntil: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  label: z.string().max(60).optional().nullable(),
+});
+
 const allyPatchSchema = z.object({
   name: z.string().min(1).optional(),
   contactPhone: z.string().optional().nullable(),
   openTime: z.string().optional().nullable(),
   closeTime: z.string().optional().nullable(),
   operatingDays: z.array(z.number().int().min(1).max(7)).optional().nullable(),
+  operatingSchedules: z.array(operatingScheduleSlotSchema).optional(),
   isTemporarilyClosed: z.boolean().optional(),
 });
 
@@ -144,6 +155,42 @@ const allyCreateSchema = z.object({
   openTime: z.string().default("12:00"),
   closeTime: z.string().default("23:00"),
   operatingDays: z.array(z.number().int().min(1).max(7)).default([1, 2, 3, 4, 5, 6, 7]),
+  operatingSchedules: z.array(operatingScheduleSlotSchema).optional(),
+});
+
+const comboFixedRecipeInputSchema = z.object({
+  inventoryItemId: z.string().uuid(),
+  displayUnit: z.enum(["ml", "oz", "L", "g", "kg", "unit"]),
+  displayQuantity: z.number().positive(),
+});
+
+const comboTemplateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  shortLabel: z.string().trim().max(32).optional().nullable(),
+  scopeType: z.enum(["category", "product"]),
+  targetId: z.string().uuid(),
+  presentationGroup: z.enum([
+    "vaso",
+    "pinta",
+    "jarra",
+    "jirafa",
+    "shot",
+    "trago",
+    "coctel",
+    "botella",
+    "lata",
+    "combo",
+    "comida",
+    "otro",
+  ]),
+  baseQuantity: z.number().int().min(1).max(20).default(1),
+  companionType: z.enum(["ally", "house", "both"]).default("ally"),
+  pricingMode: z.enum(["fixed_price", "add_on_price"]).default("fixed_price"),
+  priceValue: z.number().min(0),
+  allyId: z.string().uuid().optional().nullable(),
+  allyPayoutAmount: z.number().min(0).default(0),
+  fixedRecipes: z.array(comboFixedRecipeInputSchema).default([]),
+  isActive: z.boolean().default(true),
 });
 
 const comboCreateSchema = z.object({
@@ -231,29 +278,48 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/tables/:tableId", async (request, reply) => {
     const { branchId, tableId } = request.params as { branchId: string; tableId: string };
-    const auth = await requireBranchModulePermission(request, reply, branchId, "users", "edit");
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "pos", requiredLevel: "edit" },
+      { moduleId: "users", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
 
     const parsed = z
       .object({
-        label: z.string().min(1).max(40).optional(),
-        zone: z.string().min(1).max(40).optional(),
+        label: z.string().trim().min(1).max(40).optional(),
+        zone: z.string().trim().min(1).max(40).optional(),
       })
       .safeParse(request.body);
-    if (!parsed.success) return reply.status(400).send({ error: "INVALID_TABLE_PATCH" });
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "INVALID_TABLE_PATCH",
+        message: "Ingresa un nombre válido (1 a 40 caracteres).",
+      });
+    }
 
-    const res = await db.query(
-      `UPDATE dining_tables
-       SET label = COALESCE($3, label),
-           zone = COALESCE($4, zone)
-       WHERE id = $1 AND branch_id = $2 AND is_active = true
-       RETURNING id`,
-      [tableId, branchId, parsed.data.label?.trim() ?? null, parsed.data.zone?.trim() ?? null],
-    );
-    if (res.rows.length === 0) return reply.status(404).send({ error: "TABLE_NOT_FOUND" });
+    try {
+      const res = await db.query<{ id: string; label: string; zone: string }>(
+        `UPDATE dining_tables
+         SET label = COALESCE($3, label),
+             zone = COALESCE($4, zone)
+         WHERE id = $1 AND branch_id = $2 AND is_active = true
+         RETURNING id, label, zone`,
+        [tableId, branchId, parsed.data.label ?? null, parsed.data.zone ?? null],
+      );
+      if (res.rows.length === 0) return reply.status(404).send({ error: "TABLE_NOT_FOUND" });
 
-    broadcastCatalogChange(branchId, "TABLE_UPDATED");
-    return { id: tableId };
+      broadcastCatalogChange(branchId, "TABLE_UPDATED");
+      return res.rows[0];
+    } catch (err: unknown) {
+      const pgCode = typeof err === "object" && err && "code" in err ? String((err as { code?: unknown }).code) : "";
+      if (pgCode === "23505") {
+        return reply.status(409).send({
+          error: "TABLE_LABEL_EXISTS",
+          message: "Ya existe otra mesa con ese nombre en esta sucursal.",
+        });
+      }
+      throw err;
+    }
   });
 
   app.delete("/api/v1/branches/:branchId/tables/:tableId", async (request, reply) => {
@@ -682,7 +748,10 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create Category (e.g. "Snacks & Papas", "Cigarrillos", "Empanadas de la Casa")
   app.post("/api/v1/branches/:branchId/categories", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
     const parsed = categoryCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -706,7 +775,10 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create Product (with optional image & ally)
   app.post("/api/v1/branches/:branchId/products", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
     const parsed = productCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -783,7 +855,10 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
   // Create Presentation (with recipes & foam loss formula)
   app.post("/api/v1/branches/:branchId/presentations", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
     const parsed = presentationCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -846,7 +921,10 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
   app.patch("/api/v1/branches/:branchId/presentations/:presentationId", async (request, reply) => {
     const { branchId, presentationId } = request.params as { branchId: string; presentationId: string };
-    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
     const parsed = presentationCreateSchema.partial().safeParse(request.body);
     if (!parsed.success) {
@@ -919,20 +997,285 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
 
     const id = generateUuidV7();
     const d = parsed.data;
+    const schedules = d.operatingSchedules ?? [];
     await db.query(
-      `INSERT INTO allies (id, branch_id, name, contact_phone, operating_days, open_time, close_time, is_temporarily_closed)
-       VALUES ($1, $2, $3, $4, $5::smallint[], $6::time, $7::time, false)`,
-      [id, branchId, d.name, d.contactPhone ?? null, d.operatingDays, d.openTime, d.closeTime],
+      `INSERT INTO allies (id, branch_id, name, contact_phone, operating_days, open_time, close_time, operating_schedules, is_temporarily_closed)
+       VALUES ($1, $2, $3, $4, $5::smallint[], $6::time, $7::time, $8::jsonb, false)`,
+      [
+        id,
+        branchId,
+        d.name,
+        d.contactPhone ?? null,
+        d.operatingDays,
+        d.openTime,
+        d.closeTime,
+        JSON.stringify(schedules),
+      ],
     );
 
     broadcastCatalogChange(branchId, "ALLY_CREATED");
     return reply.status(201).send({ id });
   });
 
+  // Update Branch Operating Schedules (supports multiple weekday/weekend/late-night & seasonal date slots)
+  app.patch("/api/v1/branches/:branchId/operating-schedules", async (request, reply) => {
+    const { branchId } = request.params as { branchId: string };
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "settings", requiredLevel: "edit" },
+      { moduleId: "users", requiredLevel: "edit" },
+    ]);
+    if (!auth) return;
+
+    const parsed = z
+      .object({
+        operatingSchedules: z.array(operatingScheduleSlotSchema),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "INVALID_OPERATING_SCHEDULES",
+        message: "Revisa los días y horas del horario.",
+        issues: parsed.error.issues,
+      });
+    }
+
+    const res = await db.query<{ operatingSchedules: unknown[] }>(
+      `UPDATE branches
+       SET operating_schedules = $2::jsonb
+       WHERE id = $1
+       RETURNING operating_schedules AS "operatingSchedules"`,
+      [branchId, JSON.stringify(parsed.data.operatingSchedules)],
+    );
+    if (!res.rows[0]) return reply.status(404).send({ error: "BRANCH_NOT_FOUND" });
+
+    broadcastCatalogChange(branchId, "BRANCH_SCHEDULES_UPDATED");
+    return res.rows[0];
+  });
+
+  // Dynamic Category / Product Combo Templates (e.g. Any Craft Beer 330ml + Hot Dog Ally)
+  app.get("/api/v1/branches/:branchId/combo-templates", async (request, reply) => {
+    const { branchId } = request.params as { branchId: string };
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "view" },
+      { moduleId: "settings", requiredLevel: "view" },
+      { moduleId: "pos", requiredLevel: "view" },
+    ]);
+    if (!auth) return;
+
+    const res = await db.query(
+      `SELECT id, branch_id AS "branchId", name, short_label AS "shortLabel",
+              scope_type AS "scopeType", target_id AS "targetId",
+              presentation_group AS "presentationGroup",
+              base_quantity AS "baseQuantity",
+              companion_type AS "companionType",
+              pricing_mode AS "pricingMode",
+              price_value::float8 AS "priceValue",
+              ally_id AS "allyId",
+              ally_payout_amount::float8 AS "allyPayoutAmount",
+              COALESCE(fixed_recipes, '[]'::jsonb) AS "fixedRecipes",
+              is_active AS "isActive"
+       FROM combo_templates
+       WHERE branch_id = $1
+       ORDER BY created_at DESC`,
+      [branchId],
+    );
+    return { comboTemplates: res.rows };
+  });
+
+  async function resolveComboFixedRecipes(
+    branchId: string,
+    inputs: Array<{ inventoryItemId: string; displayUnit: DisplayUnit; displayQuantity: number }>,
+  ) {
+    const resolved: Array<{
+      inventoryItemId: string;
+      displayUnit: DisplayUnit;
+      displayQuantity: number;
+      quantityBase: number;
+      itemName: string;
+    }> = [];
+    for (const r of inputs) {
+      const invRes = await db.query<{ name: string; base_unit: BaseUnit }>(
+        `SELECT name, base_unit FROM inventory_items WHERE id = $1 AND branch_id = $2`,
+        [r.inventoryItemId, branchId],
+      );
+      const inv = invRes.rows[0];
+      if (!inv) {
+        throw new Error("COMBO_FIXED_INGREDIENT_NOT_FOUND");
+      }
+      const quantityBase = convertToBaseUnit(r.displayQuantity, r.displayUnit, inv.base_unit);
+      resolved.push({
+        inventoryItemId: r.inventoryItemId,
+        displayUnit: r.displayUnit,
+        displayQuantity: r.displayQuantity,
+        quantityBase,
+        itemName: inv.name,
+      });
+    }
+    return resolved;
+  }
+
+  app.post("/api/v1/branches/:branchId/combo-templates", async (request, reply) => {
+    const { branchId } = request.params as { branchId: string };
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
+    if (!auth) return;
+
+    const parsed = comboTemplateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "INVALID_COMBO_TEMPLATE",
+        message: "Verifica el nombre, categoría/producto, presentación y precio del combo.",
+        issues: parsed.error.issues,
+      });
+    }
+
+    const d = parsed.data;
+    const effectiveAllyId = d.companionType === "house" ? null : (d.allyId ?? null);
+    const effectiveAllyPayout = effectiveAllyId ? d.allyPayoutAmount : 0;
+    let resolvedFixedRecipes: Awaited<ReturnType<typeof resolveComboFixedRecipes>> = [];
+    if (d.companionType !== "ally" && d.fixedRecipes.length > 0) {
+      try {
+        resolvedFixedRecipes = await resolveComboFixedRecipes(branchId, d.fixedRecipes);
+      } catch {
+        return reply.status(400).send({
+          error: "COMBO_FIXED_INGREDIENT_NOT_FOUND",
+          message: "Uno de los alimentos de la casa seleccionados no existe en el inventario.",
+        });
+      }
+    }
+
+    const id = generateUuidV7();
+    await db.query(
+      `INSERT INTO combo_templates
+         (id, branch_id, name, short_label, scope_type, target_id, presentation_group,
+          base_quantity, companion_type, pricing_mode, price_value, ally_id, ally_payout_amount,
+          fixed_recipes, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15)`,
+      [
+        id,
+        branchId,
+        d.name,
+        d.shortLabel ?? null,
+        d.scopeType,
+        d.targetId,
+        d.presentationGroup,
+        d.baseQuantity,
+        d.companionType,
+        d.pricingMode,
+        d.priceValue,
+        effectiveAllyId,
+        effectiveAllyPayout,
+        JSON.stringify(resolvedFixedRecipes),
+        d.isActive,
+      ],
+    );
+
+    broadcastCatalogChange(branchId, "COMBO_TEMPLATE_CREATED");
+    return reply.status(201).send({ id });
+  });
+
+  app.patch("/api/v1/branches/:branchId/combo-templates/:templateId", async (request, reply) => {
+    const { branchId, templateId } = request.params as { branchId: string; templateId: string };
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
+    if (!auth) return;
+
+    const parsed = comboTemplateSchema.partial().safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: "INVALID_COMBO_TEMPLATE_PATCH", issues: parsed.error.issues });
+    }
+
+    const d = parsed.data;
+    let resolvedFixedRecipesJson: string | null = null;
+    if (d.fixedRecipes !== undefined) {
+      try {
+        const resolved =
+          d.companionType === "ally"
+            ? []
+            : await resolveComboFixedRecipes(branchId, d.fixedRecipes);
+        resolvedFixedRecipesJson = JSON.stringify(resolved);
+      } catch {
+        return reply.status(400).send({
+          error: "COMBO_FIXED_INGREDIENT_NOT_FOUND",
+          message: "Uno de los alimentos de la casa seleccionados no existe en el inventario.",
+        });
+      }
+    }
+
+    const clearAlly = d.companionType === "house";
+    const res = await db.query(
+      `UPDATE combo_templates
+       SET name = COALESCE($3, name),
+           short_label = CASE WHEN $4::boolean THEN $5 ELSE short_label END,
+           scope_type = COALESCE($6, scope_type),
+           target_id = COALESCE($7::uuid, target_id),
+           presentation_group = COALESCE($8, presentation_group),
+           base_quantity = COALESCE($9, base_quantity),
+           companion_type = COALESCE($10, companion_type),
+           pricing_mode = COALESCE($11, pricing_mode),
+           price_value = COALESCE($12, price_value),
+           ally_id = CASE WHEN $13::boolean THEN $14::uuid ELSE ally_id END,
+           ally_payout_amount = COALESCE($15, ally_payout_amount),
+           fixed_recipes = CASE WHEN $16::boolean THEN $17::jsonb ELSE fixed_recipes END,
+           is_active = COALESCE($18, is_active)
+       WHERE id = $1 AND branch_id = $2
+       RETURNING id`,
+      [
+        templateId,
+        branchId,
+        d.name ?? null,
+        d.shortLabel !== undefined,
+        d.shortLabel ?? null,
+        d.scopeType ?? null,
+        d.targetId ?? null,
+        d.presentationGroup ?? null,
+        d.baseQuantity ?? null,
+        d.companionType ?? null,
+        d.pricingMode ?? null,
+        d.priceValue ?? null,
+        clearAlly || d.allyId !== undefined,
+        clearAlly ? null : (d.allyId ?? null),
+        clearAlly ? 0 : (d.allyPayoutAmount ?? null),
+        resolvedFixedRecipesJson !== null,
+        resolvedFixedRecipesJson ?? "[]",
+        d.isActive ?? null,
+      ],
+    );
+    if (res.rows.length === 0) return reply.status(404).send({ error: "COMBO_TEMPLATE_NOT_FOUND" });
+
+    broadcastCatalogChange(branchId, "COMBO_TEMPLATE_UPDATED");
+    return { id: templateId };
+  });
+
+  app.delete("/api/v1/branches/:branchId/combo-templates/:templateId", async (request, reply) => {
+    const { branchId, templateId } = request.params as { branchId: string; templateId: string };
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
+    if (!auth) return;
+
+    const res = await db.query(
+      `DELETE FROM combo_templates WHERE id = $1 AND branch_id = $2 RETURNING id`,
+      [templateId, branchId],
+    );
+    if (res.rows.length === 0) return reply.status(404).send({ error: "COMBO_TEMPLATE_NOT_FOUND" });
+
+    broadcastCatalogChange(branchId, "COMBO_TEMPLATE_DELETED");
+    return { deleted: true, id: templateId };
+  });
+
   // One-step Combo Builder (supports Bar-only combos, Mixed Bar + Ally combos like "Pinta + Salchipapa", or Pure Ally combos)
   app.post("/api/v1/branches/:branchId/combos", async (request, reply) => {
     const { branchId } = request.params as { branchId: string };
-    const auth = await requireBranchModulePermission(request, reply, branchId, "settings", "edit");
+    const auth = await requireBranchAnyModulePermission(request, reply, branchId, [
+      { moduleId: "inventory", requiredLevel: "edit" },
+      { moduleId: "settings", requiredLevel: "edit" },
+    ]);
     if (!auth) return;
     const parsed = comboCreateSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -1057,7 +1400,8 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
            open_time = COALESCE($5::time, open_time),
            close_time = COALESCE($6::time, close_time),
            operating_days = COALESCE($7::smallint[], operating_days),
-           is_temporarily_closed = COALESCE($8, is_temporarily_closed)
+           operating_schedules = CASE WHEN $8::boolean THEN $9::jsonb ELSE operating_schedules END,
+           is_temporarily_closed = COALESCE($10, is_temporarily_closed)
        WHERE id = $1 AND branch_id = $2`,
       [
         allyId,
@@ -1067,6 +1411,8 @@ export async function registerAdminCatalogRoutes(app: FastifyInstance, uploadDir
         d.openTime ?? null,
         d.closeTime ?? null,
         d.operatingDays ?? null,
+        d.operatingSchedules !== undefined,
+        JSON.stringify(d.operatingSchedules ?? []),
         d.isTemporarilyClosed ?? null,
       ],
     );

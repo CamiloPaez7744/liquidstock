@@ -1,4 +1,6 @@
 import {
+  buildComboPresentationForExplosion,
+  computeComboTemplatePrice,
   DEFAULT_BRANCH_FEATURE_FLAGS,
   evaluateCreditRequest,
   evaluateLinePromotion,
@@ -7,6 +9,8 @@ import {
   generateUuidV7,
   isPromotionEligibleAt,
   type BranchFeatureFlags,
+  type ComboFixedRecipeItem,
+  type ComboTemplate,
   type Customer,
   type OfflineSyncCommand,
   type PresentationGroup,
@@ -325,7 +329,11 @@ export class PostgresSyncRepository implements ISyncRepository {
           const tableSessionId = String(payload.tableSessionId ?? generateUuidV7());
           const diningTableId = payload.diningTableId ? String(payload.diningTableId) : null;
           const initialSubAccountId = String(payload.subAccountId ?? generateUuidV7());
-          const label = String(payload.label ?? "Cuenta 1");
+          const label = String(payload.label ?? "Cuenta 1").trim().slice(0, 60) || "Cuenta 1";
+          const description =
+            typeof payload.description === "string" && payload.description.trim()
+              ? payload.description.trim().slice(0, 140)
+              : null;
           const shiftId = await getActiveCashShiftId(client, command.branchId, command.userId);
 
           await client.query(
@@ -336,10 +344,10 @@ export class PostgresSyncRepository implements ISyncRepository {
           );
 
           await client.query(
-            `INSERT INTO sub_accounts (id, branch_id, table_session_id, label, status)
-             VALUES ($1, $2, $3, $4, 'open')
+            `INSERT INTO sub_accounts (id, branch_id, table_session_id, label, description, status)
+             VALUES ($1, $2, $3, $4, $5, 'open')
              ON CONFLICT (id) DO NOTHING`,
-            [initialSubAccountId, command.branchId, tableSessionId, label],
+            [initialSubAccountId, command.branchId, tableSessionId, label, description],
           );
           break;
         }
@@ -347,13 +355,41 @@ export class PostgresSyncRepository implements ISyncRepository {
         case "CREATE_SUB_ACCOUNT": {
           const subAccountId = String(payload.subAccountId ?? generateUuidV7());
           const tableSessionId = String(payload.tableSessionId);
-          const label = String(payload.label ?? "Cuenta nueva");
+          const label = String(payload.label ?? "Cuenta nueva").trim().slice(0, 60) || "Cuenta nueva";
+          const description =
+            typeof payload.description === "string" && payload.description.trim()
+              ? payload.description.trim().slice(0, 140)
+              : null;
 
           await client.query(
-            `INSERT INTO sub_accounts (id, branch_id, table_session_id, label, status)
-             VALUES ($1, $2, $3, $4, 'open')
+            `INSERT INTO sub_accounts (id, branch_id, table_session_id, label, description, status)
+             VALUES ($1, $2, $3, $4, $5, 'open')
              ON CONFLICT (id) DO NOTHING`,
-            [subAccountId, command.branchId, tableSessionId, label],
+            [subAccountId, command.branchId, tableSessionId, label, description],
+          );
+          break;
+        }
+
+        case "UPDATE_SUB_ACCOUNT": {
+          const subAccountId = String(payload.subAccountId);
+          const nextLabel =
+            typeof payload.label === "string" && payload.label.trim()
+              ? payload.label.trim().slice(0, 60)
+              : null;
+          const hasDescriptionPatch = "description" in payload;
+          const nextDescription =
+            typeof payload.description === "string" && payload.description.trim()
+              ? payload.description.trim().slice(0, 140)
+              : null;
+
+          await client.query(
+            `UPDATE sub_accounts
+             SET label = COALESCE($3, label),
+                 description = CASE WHEN $4::boolean THEN $5 ELSE description END,
+                 version = version + 1,
+                 updated_at = now()
+             WHERE id = $1 AND branch_id = $2 AND status = 'open'`,
+            [subAccountId, command.branchId, nextLabel, hasDescriptionPatch, nextDescription],
           );
           break;
         }
@@ -471,6 +507,10 @@ export class PostgresSyncRepository implements ISyncRepository {
             typeof payload.forcedPromotionRuleId === "string" && payload.forcedPromotionRuleId.trim()
               ? payload.forcedPromotionRuleId.trim()
               : null;
+          const comboTemplateId =
+            typeof payload.comboTemplateId === "string" && payload.comboTemplateId.trim()
+              ? payload.comboTemplateId.trim()
+              : null;
 
           // Check sub-account status for multi-tablet offline conflict safety
           const subRes = await client.query<{ status: string; table_session_id: string }>(
@@ -549,16 +589,82 @@ export class PostgresSyncRepository implements ISyncRepository {
             ...(pres.feature_flags ?? {}),
           };
 
-          // Evaluate active promotions
+          // Optional unified Combo Template (dynamic category or specific product + ally and/or house stock food)
+          let comboTemplate: ComboTemplate | null = null;
+          if (comboTemplateId) {
+            const tplRes = await client.query<{
+              id: string;
+              branch_id: string;
+              name: string;
+              short_label: string | null;
+              scope_type: "category" | "product";
+              target_id: string;
+              presentation_group: PresentationGroup;
+              base_quantity: number;
+              companion_type: "ally" | "house" | "both";
+              pricing_mode: "fixed_price" | "add_on_price";
+              price_value: string;
+              ally_id: string | null;
+              ally_payout_amount: string;
+              fixed_recipes: ComboFixedRecipeItem[] | null;
+              is_active: boolean;
+            }>(
+              `SELECT id, branch_id, name, short_label, scope_type, target_id, presentation_group,
+                      base_quantity, companion_type, pricing_mode, price_value::text,
+                      ally_id, ally_payout_amount::text,
+                      COALESCE(fixed_recipes, '[]'::jsonb) AS fixed_recipes, is_active
+               FROM combo_templates
+               WHERE id = $1 AND branch_id = $2 AND is_active = true`,
+              [comboTemplateId, command.branchId],
+            );
+            const row = tplRes.rows[0];
+            if (row) {
+              const scopeMatches =
+                (row.scope_type === "category" && row.target_id === pres.category_id) ||
+                (row.scope_type === "product" && row.target_id === pres.menu_product_id);
+              if (scopeMatches && row.presentation_group === pres.presentation_group) {
+                comboTemplate = {
+                  id: row.id,
+                  branchId: row.branch_id,
+                  name: row.name,
+                  shortLabel: row.short_label,
+                  scopeType: row.scope_type,
+                  targetId: row.target_id,
+                  presentationGroup: row.presentation_group,
+                  baseQuantity: Math.max(1, Number(row.base_quantity ?? 1)),
+                  companionType: row.companion_type ?? "ally",
+                  pricingMode: row.pricing_mode,
+                  priceValue: Number(row.price_value),
+                  allyId: row.ally_id,
+                  allyPayoutAmount: Number(row.ally_payout_amount),
+                  fixedRecipes: Array.isArray(row.fixed_recipes) ? row.fixed_recipes : [],
+                  isActive: row.is_active,
+                };
+              }
+            }
+          }
+
+          // Evaluate active promotions (skipped when sold as a Combo Template)
           let promotionRuleId: string | null = null;
           let discountAmount = 0;
-          const unitPrice = Number(pres.sale_price);
+          const unitPrice = comboTemplate
+            ? computeComboTemplatePrice(comboTemplate, Number(pres.sale_price))
+            : Number(pres.sale_price);
           let lineTotal = unitPrice * quantity;
+          const comboBaseQty = Math.max(1, comboTemplate?.baseQuantity ?? 1);
+          const effectivePresentationName = comboTemplate
+            ? `${comboBaseQty > 1 ? `${comboBaseQty}× ` : ""}${pres.name} + ${comboTemplate.shortLabel || comboTemplate.name}`
+            : pres.name;
+          const effectiveProductKind: ProductKind = comboTemplate ? "combo" : pres.product_kind;
+          const effectiveAllyId = comboTemplate?.allyId ?? pres.ally_id;
+          const effectiveAllyPayout = comboTemplate?.allyId
+            ? comboTemplate.allyPayoutAmount
+            : Number(pres.ally_payout_amount);
 
           let activeRules: PromotionRule[] = [];
           const clock = getBranchClock(command.clientHlc);
 
-          if (featureFlags.enablePromotions) {
+          if (!comboTemplate && featureFlags.enablePromotions) {
             activeRules = await loadActiveBranchPromotions(client, command.branchId);
             const promoRes = evaluateLinePromotion({
               line: {
@@ -585,12 +691,12 @@ export class PostgresSyncRepository implements ISyncRepository {
                id, branch_id, sub_account_id, menu_product_id, presentation_id, added_by,
                quantity, product_name_snap, presentation_name_snap, presentation_group_snap,
                product_kind_snap, unit_price_snap, ally_id_snap, ally_payout_snap,
-               promotion_rule_id, discount_amount, line_total, status, idempotency_key, device_id
+               promotion_rule_id, discount_amount, line_total, adjustment_reason, status, idempotency_key, device_id
              ) VALUES (
                $1, $2, $3, $4, $5, $6,
                $7, $8, $9, $10,
                $11, $12, $13, $14,
-               $15, $16, $17, 'active', $18, $19
+               $15, $16, $17, $18, 'active', $19, $20
              )`,
             [
               orderItemId,
@@ -601,15 +707,16 @@ export class PostgresSyncRepository implements ISyncRepository {
               command.userId,
               quantity,
               pres.product_name,
-              pres.name,
+              effectivePresentationName,
               pres.presentation_group,
-              pres.product_kind,
+              effectiveProductKind,
               unitPrice,
-              pres.ally_id,
-              Number(pres.ally_payout_amount),
+              effectiveAllyId,
+              effectiveAllyPayout,
               promotionRuleId,
               discountAmount,
               lineTotal,
+              comboTemplate ? `Combo: ${comboTemplate.name}` : null,
               command.idempotencyKey,
               command.deviceId,
             ],
@@ -620,11 +727,11 @@ export class PostgresSyncRepository implements ISyncRepository {
             id: pres.id,
             branchId: command.branchId,
             menuProductId: pres.menu_product_id,
-            name: pres.name,
+            name: effectivePresentationName,
             presentationGroup: pres.presentation_group as ProductPresentation["presentationGroup"],
             salePrice: unitPrice,
-            allyId: pres.ally_id,
-            allyPayoutAmount: Number(pres.ally_payout_amount),
+            allyId: effectiveAllyId,
+            allyPayoutAmount: effectiveAllyPayout,
             isAvailable: true,
             sortOrder: 0,
             recipes: recipesRes.rows.map((r) => ({
@@ -639,9 +746,13 @@ export class PostgresSyncRepository implements ISyncRepository {
             })),
           };
 
+          const explosionPresentation = comboTemplate
+            ? buildComboPresentationForExplosion(domainPresentation, comboTemplate)
+            : domainPresentation;
+
           const explosion = explodePresentationSale({
-            productKind: pres.product_kind,
-            presentation: domainPresentation,
+            productKind: effectiveProductKind,
+            presentation: explosionPresentation,
             quantity,
             applyFoamLossFormula: featureFlags.enableFoamLossFormula,
           });
@@ -729,6 +840,80 @@ export class PostgresSyncRepository implements ISyncRepository {
               idempotencyKey: command.idempotencyKey,
               status: "conflict_flagged",
               detail: "Sub-cuenta ya cerrada; ítem guardado en sub-cuenta de recuperación.",
+            };
+          }
+          break;
+        }
+
+        case "ADD_CUSTOM_CHARGE": {
+          const orderItemId = String(payload.orderItemId ?? generateUuidV7());
+          let subAccountId = String(payload.subAccountId);
+          const description = String(payload.description ?? "").trim();
+          const categoryLabel = String(payload.categoryLabel ?? "Cargo adicional").trim() || "Cargo adicional";
+          const quantity = Math.max(1, Number(payload.quantity ?? 1));
+          const unitAmount = Number(payload.amount ?? 0);
+
+          if (!description || !Number.isFinite(unitAmount) || unitAmount <= 0) {
+            throw new Error("INVALID_CUSTOM_CHARGE");
+          }
+
+          let conflictFlagged = false;
+          const subRes = await client.query<{ status: string; table_session_id: string }>(
+            `SELECT status, table_session_id FROM sub_accounts WHERE id = $1 FOR UPDATE`,
+            [subAccountId],
+          );
+          if (subRes.rows[0] && subRes.rows[0].status !== "open") {
+            const recoverySubId = generateUuidV7();
+            await client.query(
+              `INSERT INTO sub_accounts (id, branch_id, table_session_id, label, status)
+               VALUES ($1, $2, $3, 'Cuenta Adicional (Offline)', 'open')`,
+              [recoverySubId, command.branchId, subRes.rows[0].table_session_id],
+            );
+            await client.query(
+              `UPDATE table_sessions SET status = 'open', closed_at = NULL WHERE id = $1`,
+              [subRes.rows[0].table_session_id],
+            );
+            subAccountId = recoverySubId;
+            conflictFlagged = true;
+          }
+
+          const lineTotal = Math.round(unitAmount * quantity * 100) / 100;
+
+          await client.query(
+            `INSERT INTO order_items (
+               id, branch_id, sub_account_id, menu_product_id, presentation_id, added_by,
+               quantity, product_name_snap, presentation_name_snap, presentation_group_snap,
+               product_kind_snap, unit_price_snap, ally_id_snap, ally_payout_snap,
+               promotion_rule_id, discount_amount, line_total, adjustment_reason, status, idempotency_key, device_id
+             ) VALUES (
+               $1, $2, $3, NULL, NULL, $4,
+               $5, $6, $7, 'otro',
+               'standard', $8, NULL, 0,
+               NULL, 0, $9, $10, 'active', $11, $12
+             )`,
+            [
+              orderItemId,
+              command.branchId,
+              subAccountId,
+              command.userId,
+              quantity,
+              description,
+              categoryLabel,
+              unitAmount,
+              lineTotal,
+              categoryLabel,
+              command.idempotencyKey,
+              command.deviceId,
+            ],
+          );
+
+          await recalculateSubAccountTotals(client, subAccountId);
+
+          if (conflictFlagged) {
+            return {
+              idempotencyKey: command.idempotencyKey,
+              status: "conflict_flagged",
+              detail: "Sub-cuenta ya cerrada; cargo adicional guardado en sub-cuenta de recuperación.",
             };
           }
           break;

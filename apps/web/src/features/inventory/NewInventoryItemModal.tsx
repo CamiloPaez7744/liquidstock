@@ -11,7 +11,13 @@ import {
   Wine,
   X,
 } from "lucide-react";
-import type { BaseUnit, DisplayUnit, MenuCategory, PresentationGroup } from "@liquistock/domain";
+import type {
+  BaseUnit,
+  DisplayUnit,
+  MenuCategory,
+  PaymentMethod,
+  PresentationGroup,
+} from "@liquistock/domain";
 import { apiFetch } from "../../infrastructure/api/api-client.js";
 import {
   BeerBottleIcon,
@@ -136,6 +142,15 @@ const PRESETS: PresetConfig[] = [
         displayQuantity: "500",
         pourLossPercent: "8",
         fixedLossBase: "15",
+      },
+      {
+        name: "Jarra 1.5L",
+        presentationGroup: "jarra",
+        salePrice: "38000",
+        displayUnit: "L",
+        displayQuantity: "1.5",
+        pourLossPercent: "5",
+        fixedLossBase: "20",
       },
       {
         name: "Jirafa 3L",
@@ -356,6 +371,7 @@ interface NewInventoryItemModalProps {
   branchId: string;
   userId: string;
   categories: MenuCategory[];
+  treasuryAccounts?: PaymentMethod[];
   onCreated: (createdItemId?: string) => Promise<void>;
   onClose: () => void;
 }
@@ -364,6 +380,7 @@ export function NewInventoryItemModal({
   branchId,
   userId,
   categories,
+  treasuryAccounts = [],
   onCreated,
   onClose,
 }: NewInventoryItemModalProps) {
@@ -383,6 +400,10 @@ export function NewInventoryItemModal({
   const [initialStock, setInitialStock] = useState(firstPreset.initialStock);
   const [initialCost, setInitialCost] = useState(firstPreset.initialCost);
   const [minStock, setMinStock] = useState(firstPreset.minStock);
+  const [paymentStatus, setPaymentStatus] = useState<"paid" | "pending" | "partial" | "none">("paid");
+  const [paymentMethodId, setPaymentMethodId] = useState(treasuryAccounts[0]?.id ?? "");
+  const [paidAmount, setPaidAmount] = useState("");
+  const [supplierName, setSupplierName] = useState("");
 
   const [publishToMenu, setPublishToMenu] = useState(true);
   const [categoryId, setCategoryId] = useState<string>(initialCat?.id ?? "__new__");
@@ -491,6 +512,13 @@ export function NewInventoryItemModal({
           defaultPourLossPercent: Number(defaultPourLossPct) || 0,
           isKeg,
           userId,
+          paymentStatus: Number(initialCost) > 0 ? paymentStatus : "none",
+          paymentMethodId:
+            paymentStatus === "paid" || paymentStatus === "partial"
+              ? paymentMethodId || treasuryAccounts[0]?.id || undefined
+              : undefined,
+          paidAmount: paymentStatus === "partial" ? Number(paidAmount) || 0 : undefined,
+          supplierName: supplierName.trim() || undefined,
           purchasePresentations: validFormats.length > 0 ? validFormats : undefined,
           publishToMenu: publishToMenu
             ? {
@@ -732,6 +760,82 @@ export function NewInventoryItemModal({
                 Es barril de cerveza artesanal (calcula pintas restantes y espuma)
               </label>
             )}
+
+            {/* Conexión automática con Ingresos/Egresos y Cuentas por Pagar a Proveedores (siempre visible) */}
+            <div className="space-y-2.5 rounded-xl border border-primary/25 bg-primary/5 p-3 text-xs">
+              <p className="font-bold text-primary">
+                Registro en Ingresos y Egresos (editable luego en Finanzas)
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {(
+                  [
+                    { id: "paid", label: "Pagado completo" },
+                    { id: "pending", label: "Pendiente (fiado proveedor)" },
+                    { id: "partial", label: "Pago parcial" },
+                    { id: "none", label: "Solo stock (sin afectar caja)" },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setPaymentStatus(opt.id)}
+                    className={`press-response rounded-lg border px-2.5 py-1.5 text-[11px] font-bold ${
+                      paymentStatus === opt.id
+                        ? "border-primary bg-primary/20 text-primary"
+                        : "border-white/10 bg-background/70 text-muted-foreground"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              {paymentStatus !== "none" && (
+                <>
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    {(paymentStatus === "paid" || paymentStatus === "partial") && (
+                      <select
+                        value={paymentMethodId || treasuryAccounts[0]?.id || ""}
+                        onChange={(e) => setPaymentMethodId(e.target.value)}
+                        className="rounded-xl border border-white/15 bg-background px-2.5 py-2 text-xs"
+                      >
+                        {treasuryAccounts.map((acc) => (
+                          <option key={acc.id} value={acc.id}>
+                            Sale de: {acc.name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    {paymentStatus === "partial" && (
+                      <input
+                        type="number"
+                        min={0}
+                        placeholder="Abono inicial (COP)"
+                        value={paidAmount}
+                        onChange={(e) => setPaidAmount(e.target.value)}
+                        className="rounded-xl border border-white/15 bg-background px-2.5 py-2 text-xs font-bold tabular-nums"
+                      />
+                    )}
+                    <input
+                      type="text"
+                      placeholder={
+                        paymentStatus === "paid"
+                          ? "Proveedor (opcional)"
+                          : "Nombre del proveedor *"
+                      }
+                      value={supplierName}
+                      onChange={(e) => setSupplierName(e.target.value)}
+                      className="rounded-xl border border-white/15 bg-background px-2.5 py-2 text-xs"
+                    />
+                  </div>
+                  {!(Number(initialCost) > 0) && (
+                    <p className="text-[11px] font-medium text-warning">
+                      Ingresa el costo de inversión arriba (mayor a $0) para que se registre en Ingresos y Egresos / Proveedores.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
           </div>
 
           {/* 3. Publicar directo en Menú del POS */}

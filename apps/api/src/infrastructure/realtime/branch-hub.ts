@@ -6,7 +6,8 @@ export interface BranchRealtimeEvent {
     | "ORDER_UPDATED"
     | "INVENTORY_UPDATED"
     | "CATALOG_UPDATED"
-    | "SHIFT_UPDATED";
+    | "SHIFT_UPDATED"
+    | "OPERATIONS_PURGED";
   branchId: string;
   originDeviceId: string;
   timestamp: string;

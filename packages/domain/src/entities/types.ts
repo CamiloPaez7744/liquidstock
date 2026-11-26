@@ -2,7 +2,7 @@ import type { BaseUnit, DisplayUnit } from "../value-objects/units.js";
 
 export type UserRole = "admin" | "waiter" | "cashier";
 
-export type AppModuleId = "pos" | "inventory" | "cash" | "kpis" | "settings" | "users";
+export type AppModuleId = "pos" | "inventory" | "cash" | "finance" | "kpis" | "settings" | "users";
 
 export type ModuleAccessLevel = "none" | "view" | "edit";
 
@@ -15,6 +15,7 @@ export const DEFAULT_BRANCH_ROLE_PERMISSIONS: BranchRolePermissions = {
     pos: "edit",
     inventory: "edit",
     cash: "edit",
+    finance: "edit",
     kpis: "edit",
     settings: "edit",
     users: "edit",
@@ -23,6 +24,7 @@ export const DEFAULT_BRANCH_ROLE_PERMISSIONS: BranchRolePermissions = {
     pos: "edit",
     inventory: "view",
     cash: "edit",
+    finance: "none",
     kpis: "none",
     settings: "none",
     users: "none",
@@ -31,6 +33,7 @@ export const DEFAULT_BRANCH_ROLE_PERMISSIONS: BranchRolePermissions = {
     pos: "edit",
     inventory: "view",
     cash: "edit",
+    finance: "none",
     kpis: "none",
     settings: "none",
     users: "none",
@@ -116,6 +119,18 @@ export const DEFAULT_BRANCH_FEATURE_FLAGS: BranchFeatureFlags = {
   allowCloseShiftWithOpenTables: true,
 };
 
+export interface OperatingScheduleSlot {
+  /** ISO days of week: 1=Mon .. 7=Sun */
+  daysOfWeek: number[];
+  /** "HH:MM" in branch local time (supports overnight e.g. 17:00 -> 03:00) */
+  openTime: string;
+  closeTime: string;
+  /** Optional calendar range "YYYY-MM-DD" (for seasonal / holiday schedules) */
+  validFrom?: string | null;
+  validUntil?: string | null;
+  label?: string | null;
+}
+
 export interface Branch {
   id: string;
   organizationId: string;
@@ -124,6 +139,7 @@ export interface Branch {
   timezone: string;
   featureFlags: BranchFeatureFlags;
   rolePermissions?: BranchRolePermissions;
+  operatingSchedules?: OperatingScheduleSlot[];
   isActive: boolean;
 }
 
@@ -164,7 +180,37 @@ export interface Ally {
   name: string;
   contactPhone?: string | null;
   operatingSchedule?: AllyOperatingSchedule | null;
+  operatingSchedules?: OperatingScheduleSlot[];
   isTemporarilyClosed: boolean;
+  isActive: boolean;
+}
+
+export interface ComboFixedRecipeItem {
+  inventoryItemId: string;
+  displayUnit: DisplayUnit;
+  displayQuantity: number;
+  quantityBase: number;
+  itemName?: string | null;
+}
+
+export interface ComboTemplate {
+  id: string;
+  branchId: string;
+  name: string;
+  shortLabel?: string | null;
+  scopeType: "category" | "product";
+  targetId: string;
+  presentationGroup: PresentationGroup;
+  /** Number of base drinks included in the combo (default 1, e.g. 2x Pinta + Salchipapa) */
+  baseQuantity?: number;
+  /** Whether the fixed companion is from a third-party ally, house stock, or both */
+  companionType?: "ally" | "house" | "both";
+  pricingMode: "fixed_price" | "add_on_price";
+  priceValue: number;
+  allyId?: string | null;
+  allyPayoutAmount: number;
+  /** Optional in-house fixed inventory items deducted alongside the chosen drink */
+  fixedRecipes?: ComboFixedRecipeItem[];
   isActive: boolean;
 }
 
@@ -241,6 +287,7 @@ export interface PaymentMethod {
   name: string;
   code: string;
   countsAsPhysicalCash: boolean;
+  isInternalVault?: boolean;
   sortOrder: number;
   isActive: boolean;
 }
@@ -283,9 +330,9 @@ export interface PromotionRule {
 export interface OrderItemLine {
   id: string;
   subAccountId: string;
-  menuProductId: string;
-  presentationId: string;
-  categoryId: string;
+  menuProductId?: string | null;
+  presentationId?: string | null;
+  categoryId?: string | null;
   productNameSnap: string;
   presentationNameSnap: string;
   presentationGroupSnap: PresentationGroup;
@@ -304,8 +351,10 @@ export interface OrderItemLine {
 export type SyncCommandType =
   | "OPEN_TABLE_SESSION"
   | "CREATE_SUB_ACCOUNT"
+  | "UPDATE_SUB_ACCOUNT"
   | "DELETE_SUB_ACCOUNT"
   | "ADD_ORDER_ITEM"
+  | "ADD_CUSTOM_CHARGE"
   | "VOID_ORDER_ITEM"
   | "MOVE_ORDER_ITEM"
   | "ADJUST_ORDER_ITEM_PRICE"

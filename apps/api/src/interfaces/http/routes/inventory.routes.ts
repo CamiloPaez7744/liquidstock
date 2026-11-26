@@ -6,7 +6,11 @@ import {
   type BaseUnit,
   type DisplayUnit,
 } from "@liquistock/domain";
-import { requireBranchModulePermission } from "../../../infrastructure/auth/auth-guard.js";
+import {
+  requireBranchModulePermission,
+  requireBranchRole,
+} from "../../../infrastructure/auth/auth-guard.js";
+import { verifySecret } from "../../../infrastructure/auth/crypto.js";
 import { db, withTransaction } from "../../../infrastructure/db/pool.js";
 import { branchHub } from "../../../infrastructure/realtime/branch-hub.js";
 
@@ -42,42 +46,53 @@ const quickMenuPresentationSchema = z.object({
   fixedLossBase: z.number().min(0).default(0),
 });
 
-const createInventoryItemSchema = z.object({
-  name: z.string().min(1).max(120),
-  sku: z.string().optional().nullable(),
-  baseUnit: z.enum(["ml", "g", "unit"]),
-  initialStockBase: z.number().min(0).default(0),
-  initialTotalCost: z.number().min(0).default(0),
-  minStockBase: z.number().min(0).default(0),
-  defaultPourLossPercent: z.number().min(0).max(100).default(0),
-  isKeg: z.boolean().default(false),
-  userId: z.string().uuid().optional(),
-  purchasePresentation: purchasePresentationInputSchema.optional(),
-  purchasePresentations: z.array(purchasePresentationInputSchema).optional(),
-  /** Optional one-step publish directly to the POS Menu */
-  publishToMenu: z
-    .object({
-      categoryId: z.string().uuid().optional(),
-      newCategoryName: z.string().min(1).max(60).optional(),
-      productName: z.string().min(1).max(120).optional(),
-      imageUrl: z.string().max(500).optional().nullable(),
-      editionTag: z.string().max(32).optional().nullable(),
-      isAvailable: z.boolean().optional(),
-      presentations: z.array(quickMenuPresentationSchema).min(1),
-    })
-    .optional(),
+const purchaseFinanceSchema = z.object({
+  paymentStatus: z.enum(["none", "paid", "pending", "partial"]).default("none"),
+  paymentMethodId: z.string().uuid().optional().nullable(),
+  paidAmount: z.number().min(0).optional(),
+  supplierName: z.string().trim().max(120).optional().nullable(),
 });
 
-const movementSchema = z.object({
-  inventoryItemId: z.string().uuid(),
-  movementType: z.enum(["purchase", "waste", "manual_adjustment"]),
-  presentationId: z.string().uuid().optional().nullable(),
-  presentationUnits: z.number().positive().optional(),
-  quantityBase: z.number().optional(),
-  totalCost: z.number().min(0).optional(),
-  reason: z.string().min(1).max(200),
-  userId: z.string().uuid().optional(),
-});
+const createInventoryItemSchema = z
+  .object({
+    name: z.string().min(1).max(120),
+    sku: z.string().optional().nullable(),
+    baseUnit: z.enum(["ml", "g", "unit"]),
+    initialStockBase: z.number().min(0).default(0),
+    initialTotalCost: z.number().min(0).default(0),
+    minStockBase: z.number().min(0).default(0),
+    defaultPourLossPercent: z.number().min(0).max(100).default(0),
+    isKeg: z.boolean().default(false),
+    userId: z.string().uuid().optional(),
+    purchasePresentation: purchasePresentationInputSchema.optional(),
+    purchasePresentations: z.array(purchasePresentationInputSchema).optional(),
+    /** Optional one-step publish directly to the POS Menu */
+    publishToMenu: z
+      .object({
+        categoryId: z.string().uuid().optional(),
+        newCategoryName: z.string().min(1).max(60).optional(),
+        productName: z.string().min(1).max(120).optional(),
+        imageUrl: z.string().max(500).optional().nullable(),
+        editionTag: z.string().max(32).optional().nullable(),
+        isAvailable: z.boolean().optional(),
+        presentations: z.array(quickMenuPresentationSchema).min(1),
+      })
+      .optional(),
+  })
+  .merge(purchaseFinanceSchema);
+
+const movementSchema = z
+  .object({
+    inventoryItemId: z.string().uuid(),
+    movementType: z.enum(["purchase", "waste", "manual_adjustment"]),
+    presentationId: z.string().uuid().optional().nullable(),
+    presentationUnits: z.number().positive().optional(),
+    quantityBase: z.number().optional(),
+    totalCost: z.number().min(0).optional(),
+    reason: z.string().min(1).max(200),
+    userId: z.string().uuid().optional(),
+  })
+  .merge(purchaseFinanceSchema);
 
 const composedIngredientSchema = z.object({
   inventoryItemId: z.string().uuid().optional(),
@@ -108,6 +123,109 @@ const createComposedRecipeSchema = z.object({
   imageUrl: z.string().max(500).optional().nullable(),
   ingredients: z.array(composedIngredientSchema).min(1),
 });
+
+async function recordPurchaseFinancialImpact(
+  client: Parameters<Parameters<typeof withTransaction>[0]>[0],
+  params: {
+    branchId: string;
+    userId: string;
+    inventoryItemId: string;
+    itemName: string;
+    ledgerId: string;
+    totalCost: number;
+    paymentStatus: "none" | "paid" | "pending" | "partial";
+    paymentMethodId?: string | null;
+    paidAmount?: number;
+    supplierName?: string | null;
+    reason?: string;
+  },
+): Promise<{ cashExpenseId: string | null; supplierPayableId: string | null }> {
+  const {
+    branchId,
+    userId,
+    inventoryItemId,
+    itemName,
+    ledgerId,
+    totalCost,
+    paymentStatus,
+    paymentMethodId,
+    paidAmount,
+    supplierName,
+    reason,
+  } = params;
+  if (paymentStatus === "none" || totalCost <= 0) {
+    return { cashExpenseId: null, supplierPayableId: null };
+  }
+
+  const openShiftRes = await client.query<{ id: string }>(
+    `SELECT id FROM cash_shifts WHERE branch_id = $1 AND status = 'open' LIMIT 1`,
+    [branchId],
+  );
+  const shiftId = openShiftRes.rows[0]?.id ?? null;
+
+  const actualPaid =
+    paymentStatus === "paid"
+      ? totalCost
+      : paymentStatus === "partial"
+        ? Math.min(totalCost, Math.max(0, Number(paidAmount ?? 0)))
+        : 0;
+  const remainingDebt = Math.max(0, Math.round((totalCost - actualPaid) * 100) / 100);
+
+  let cashExpenseId: string | null = null;
+  let supplierPayableId: string | null = null;
+
+  if (actualPaid > 0 && paymentMethodId) {
+    const pmOk = await client.query(
+      `SELECT 1 FROM payment_methods WHERE id = $1 AND branch_id = $2 AND is_active = true`,
+      [paymentMethodId, branchId],
+    );
+    if (pmOk.rows.length === 0) {
+      throw new Error("INVALID_PAYMENT_METHOD");
+    }
+    cashExpenseId = generateUuidV7();
+    const desc = supplierName
+      ? `Compra stock (${supplierName}): ${itemName}${reason ? ` · ${reason}` : ""}`
+      : `Compra stock: ${itemName}${reason ? ` · ${reason}` : ""}`;
+    await client.query(
+      `INSERT INTO cash_expenses
+         (id, branch_id, cash_shift_id, payment_method_id, category, description, amount, reference_type, reference_id, created_by)
+       VALUES ($1, $2, $3, $4, 'insumos', $5, $6, 'inventory_purchase', $7, $8)`,
+      [cashExpenseId, branchId, shiftId, paymentMethodId, desc.slice(0, 200), actualPaid, ledgerId, userId],
+    );
+  }
+
+  if (remainingDebt > 0) {
+    supplierPayableId = generateUuidV7();
+    const cleanSupplier = supplierName?.trim() || "Proveedor sin especificar";
+    const desc = `Compra stock: ${itemName}${reason ? ` · ${reason}` : ""}`;
+    await client.query(
+      `INSERT INTO supplier_payables
+         (id, branch_id, supplier_name, description, inventory_item_id, total_amount, paid_amount, status, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        supplierPayableId,
+        branchId,
+        cleanSupplier,
+        desc.slice(0, 200),
+        inventoryItemId,
+        totalCost,
+        actualPaid,
+        actualPaid > 0 ? "partial" : "pending",
+        userId,
+      ],
+    );
+    if (actualPaid > 0 && paymentMethodId) {
+      await client.query(
+        `INSERT INTO supplier_payments
+           (id, branch_id, supplier_payable_id, payment_method_id, cash_expense_id, amount, notes, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, 'Abono inicial al ingresar compra', $7)`,
+        [generateUuidV7(), branchId, supplierPayableId, paymentMethodId, cashExpenseId, actualPaid, userId],
+      );
+    }
+  }
+
+  return { cashExpenseId, supplierPayableId };
+}
 
 export async function registerInventoryRoutes(app: FastifyInstance) {
   app.post("/api/v1/branches/:branchId/inventory/items", async (request, reply) => {
@@ -179,6 +297,10 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
       }
 
       // Record opening stock in immutable inventory_ledger
+      let financeResult: { cashExpenseId: string | null; supplierPayableId: string | null } = {
+        cashExpenseId: null,
+        supplierPayableId: null,
+      };
       if (d.initialStockBase > 0) {
         const ledgerId = generateUuidV7();
         await client.query(
@@ -195,7 +317,22 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
            )`,
           [ledgerId, branchId, itemId, d.initialStockBase, avgUnitCost, defaultPurchasePresId, auth.userId],
         );
+        if (d.initialTotalCost > 0 && d.paymentStatus !== "none") {
+          financeResult = await recordPurchaseFinancialImpact(client, {
+            branchId,
+            userId: auth.userId,
+            inventoryItemId: itemId,
+            itemName: d.name,
+            ledgerId,
+            totalCost: d.initialTotalCost,
+            paymentStatus: d.paymentStatus,
+            paymentMethodId: d.paymentMethodId,
+            paidAmount: d.paidAmount,
+            supplierName: d.supplierName,
+          });
+        }
       }
+      void financeResult;
 
       // Optional 1-step publish to POS menu (product + sellable presentations + recipes)
       if (d.publishToMenu) {
@@ -551,10 +688,11 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
     const d = parsed.data;
     const result = await withTransaction(async (client) => {
       const invRes = await client.query<{
+        name: string;
         current_stock_base: string;
         avg_unit_cost_base: string;
       }>(
-        `SELECT current_stock_base::text, avg_unit_cost_base::text
+        `SELECT name, current_stock_base::text, avg_unit_cost_base::text
          FROM inventory_items
          WHERE id = $1 AND branch_id = $2
          FOR UPDATE`,
@@ -633,7 +771,27 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
         ],
       );
 
-      return { ledgerId, nextStock, deltaBase };
+      let financeImpact: { cashExpenseId: string | null; supplierPayableId: string | null } = {
+        cashExpenseId: null,
+        supplierPayableId: null,
+      };
+      if (d.movementType === "purchase" && (d.totalCost ?? 0) > 0 && d.paymentStatus !== "none") {
+        financeImpact = await recordPurchaseFinancialImpact(client, {
+          branchId,
+          userId: auth.userId,
+          inventoryItemId: d.inventoryItemId,
+          itemName: inv.name,
+          ledgerId,
+          totalCost: d.totalCost ?? 0,
+          paymentStatus: d.paymentStatus,
+          paymentMethodId: d.paymentMethodId,
+          paidAmount: d.paidAmount,
+          supplierName: d.supplierName,
+          reason: d.reason,
+        });
+      }
+
+      return { ledgerId, nextStock, deltaBase, ...financeImpact };
     });
 
     branchHub.broadcast({
@@ -643,8 +801,148 @@ export async function registerInventoryRoutes(app: FastifyInstance) {
       timestamp: new Date().toISOString(),
       payload: result,
     });
+    if (result.cashExpenseId || result.supplierPayableId) {
+      branchHub.broadcast({
+        type: "SHIFT_UPDATED",
+        branchId,
+        originDeviceId: "inventory",
+        timestamp: new Date().toISOString(),
+        payload: { action: "STOCK_PURCHASE_FINANCE", ...result },
+      });
+    }
 
     return reply.status(201).send(result);
+  });
+
+  // Strictly Admin-only password-verified physical stock count correction (creates immutable manual_adjustment ledger row)
+  app.post("/api/v1/branches/:branchId/inventory/items/:itemId/reconcile", async (request, reply) => {
+    const { branchId, itemId } = request.params as { branchId: string; itemId: string };
+    const auth = await requireBranchRole(request, reply, branchId, ["admin"]);
+    if (!auth) return;
+
+    const parsed = z
+      .object({
+        targetStockBase: z.number().min(0),
+        reason: z.string().trim().min(3, "Escribe el motivo del ajuste (mín. 3 caracteres).").max(200),
+        adminPassword: z.string().min(1, "Ingresa tu contraseña de administrador."),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "INVALID_RECONCILE_INPUT",
+        message: parsed.error.issues[0]?.message ?? "Revisa el stock real, el motivo y tu contraseña.",
+        issues: parsed.error.issues,
+      });
+    }
+
+    const userRes = await db.query<{ password_hash: string | null }>(
+      `SELECT password_hash FROM users WHERE id = $1`,
+      [auth.userId],
+    );
+    const passwordOk = await verifySecret(
+      parsed.data.adminPassword,
+      userRes.rows[0]?.password_hash,
+    );
+    if (!passwordOk) {
+      return reply.status(401).send({
+        error: "INVALID_ADMIN_PASSWORD",
+        message: "Contraseña de administrador incorrecta.",
+      });
+    }
+
+    const d = parsed.data;
+    try {
+      const result = await withTransaction(async (client) => {
+        const invRes = await client.query<{
+          name: string;
+          current_stock_base: string;
+          avg_unit_cost_base: string;
+        }>(
+          `SELECT name, current_stock_base::text, avg_unit_cost_base::text
+           FROM inventory_items
+           WHERE id = $1 AND branch_id = $2
+           FOR UPDATE`,
+          [itemId, branchId],
+        );
+        const inv = invRes.rows[0];
+        if (!inv) {
+          throw new Error("INVENTORY_ITEM_NOT_FOUND");
+        }
+
+        const previousStockBase = Math.round(Number(inv.current_stock_base) * 1000) / 1000;
+        const nextStockBase = Math.round(d.targetStockBase * 1000) / 1000;
+        const deltaBase = Math.round((nextStockBase - previousStockBase) * 1000) / 1000;
+
+        if (Math.abs(deltaBase) < 0.001) {
+          throw new Error("NO_STOCK_CHANGE");
+        }
+
+        await client.query(
+          `UPDATE inventory_items
+           SET current_stock_base = $2,
+               updated_at = now()
+           WHERE id = $1`,
+          [itemId, nextStockBase],
+        );
+
+        const ledgerId = generateUuidV7();
+        const reasonText = `[Cuadre físico Admin] ${d.reason}`.slice(0, 200);
+        await client.query(
+          `INSERT INTO inventory_ledger (
+             id, branch_id, inventory_item_id, movement_type,
+             quantity_delta_base, nominal_qty_base, pour_loss_qty_base,
+             stock_after_base, unit_cost_base, reference_type,
+             presentation_id, reason, created_by, idempotency_key
+           ) VALUES (
+             $1, $2, $3, 'manual_adjustment',
+             $4, $4, 0,
+             $5, $6, 'admin_stock_reconciliation',
+             NULL, $7, $8, $1
+           )`,
+          [
+            ledgerId,
+            branchId,
+            itemId,
+            deltaBase,
+            nextStockBase,
+            Number(inv.avg_unit_cost_base),
+            reasonText,
+            auth.userId,
+          ],
+        );
+
+        return {
+          ledgerId,
+          inventoryItemId: itemId,
+          itemName: inv.name,
+          previousStockBase,
+          nextStockBase,
+          deltaBase,
+        };
+      });
+
+      branchHub.broadcast({
+        type: "INVENTORY_UPDATED",
+        branchId,
+        originDeviceId: "admin",
+        timestamp: new Date().toISOString(),
+        payload: { action: "ADMIN_STOCK_RECONCILED", ...result },
+      });
+
+      return reply.status(200).send(result);
+    } catch (err) {
+      const code = err instanceof Error ? err.message : "";
+      if (code === "INVENTORY_ITEM_NOT_FOUND") {
+        return reply.status(404).send({ error: "INVENTORY_ITEM_NOT_FOUND", message: "Insumo no encontrado." });
+      }
+      if (code === "NO_STOCK_CHANGE") {
+        return reply.status(400).send({
+          error: "NO_STOCK_CHANGE",
+          message: "La cantidad ingresada es igual al stock actual.",
+        });
+      }
+      throw err;
+    }
   });
 
   app.get("/api/v1/branches/:branchId/inventory/ledger", async (request, reply) => {

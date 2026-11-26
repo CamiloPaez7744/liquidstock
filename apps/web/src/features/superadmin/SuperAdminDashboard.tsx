@@ -1,18 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  AlertTriangle,
   Ban,
   Building2,
   CheckCircle2,
   Clock,
   Crown,
   Globe,
+  Lock,
   LogOut,
   MapPin,
   Phone,
   RefreshCw,
+  Rocket,
   Search,
+  ShieldCheck,
   Store,
   Users,
+  X,
   XCircle,
 } from "lucide-react";
 import {
@@ -21,7 +26,15 @@ import {
   type OrganizationSocialLinks,
   type StoredAuthUser,
 } from "../../infrastructure/api/api-client.js";
+import { formatCOP } from "../../shared/lib/format.js";
 import { haptics } from "../../shared/lib/haptics.js";
+
+interface PlatformBranch {
+  id: string;
+  name: string;
+  code: string;
+  operationalGoLiveAt: string | null;
+}
 
 interface PlatformBar {
   id: string;
@@ -43,6 +56,43 @@ interface PlatformBar {
   ownerEmail: string | null;
   branchCount: number;
   userCount: number;
+  branches: PlatformBranch[];
+}
+
+interface PurgePreviewResponse {
+  branch: {
+    id: string;
+    name: string;
+    code: string;
+    operationalGoLiveAt: string | null;
+    organizationName: string;
+  };
+  toDelete: {
+    orderItems: number;
+    tableSessions: number;
+    payments: number;
+    creditLedgerEntries: number;
+    debtorsToReset: number;
+    totalPendingDebtToReset: number;
+    allySettlements: number;
+    cashExpenses: number;
+    cashExtras: number;
+    cashShifts: number;
+    inventoryLedgerEntries: number;
+    itemsWithTestSales: number;
+  };
+  toPreserve: {
+    categories: number;
+    menuProducts: number;
+    presentations: number;
+    inventoryItems: number;
+    diningTables: number;
+    paymentMethods: number;
+    promotions: number;
+    allies: number;
+    customers: number;
+    users: number;
+  };
 }
 
 interface PlatformCounts {
@@ -87,6 +137,87 @@ export function SuperAdminDashboard({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notesByBar, setNotesByBar] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  // Go-Live Operational Purge Modal state
+  const [purgeTarget, setPurgeTarget] = useState<{
+    barName: string;
+    branch: PlatformBranch;
+  } | null>(null);
+  const [purgePreview, setPurgePreview] = useState<PurgePreviewResponse | null>(null);
+  const [purgeLoading, setPurgeLoading] = useState(false);
+  const [purgeStockMode, setPurgeStockMode] = useState<"keep_current_stock" | "restore_test_sales">(
+    "keep_current_stock",
+  );
+  const [purgeOpeningFloat, setPurgeOpeningFloat] = useState("0");
+  const [purgeConfirmCode, setPurgeConfirmCode] = useState("");
+  const [purgePassword, setPurgePassword] = useState("");
+  const [purgeError, setPurgeError] = useState<string | null>(null);
+  const [purgeExecuting, setPurgeExecuting] = useState(false);
+
+  const openPurgeModal = async (barName: string, branch: PlatformBranch) => {
+    haptics.tap();
+    setPurgeTarget({ barName, branch });
+    setPurgePreview(null);
+    setPurgeStockMode("keep_current_stock");
+    setPurgeOpeningFloat("0");
+    setPurgeConfirmCode("");
+    setPurgePassword("");
+    setPurgeError(null);
+    setPurgeLoading(true);
+    try {
+      const preview = await apiFetch<PurgePreviewResponse>(
+        `/api/v1/superadmin/branches/${branch.id}/purge-preview`,
+      );
+      setPurgePreview(preview);
+    } catch (err) {
+      setPurgeError(err instanceof Error ? err.message : "No se pudo cargar el resumen");
+    } finally {
+      setPurgeLoading(false);
+    }
+  };
+
+  const handleExecutePurge = async () => {
+    if (!purgeTarget || purgeExecuting) return;
+    setPurgeError(null);
+    if (purgeConfirmCode.trim().toUpperCase() !== purgeTarget.branch.code.trim().toUpperCase()) {
+      setPurgeError(`Debes escribir exactamente el código "${purgeTarget.branch.code}".`);
+      return;
+    }
+    if (!purgePassword) {
+      setPurgeError("Ingresa tu contraseña de SuperAdmin para confirmar.");
+      return;
+    }
+    setPurgeExecuting(true);
+    try {
+      const res = await apiFetch<{
+        branchName: string;
+        deletedOrderItems: number;
+        restoredItemsCount: number;
+        openingLedgerSnapshots: number;
+      }>(`/api/v1/superadmin/branches/${purgeTarget.branch.id}/purge-operations`, {
+        method: "POST",
+        body: JSON.stringify({
+          confirmBranchCode: purgeConfirmCode.trim(),
+          superAdminPassword: purgePassword,
+          stockMode: purgeStockMode,
+          openingFloat: Math.max(0, Number(purgeOpeningFloat) || 0),
+        }),
+      });
+      haptics.success();
+      setPurgeTarget(null);
+      setPurgePreview(null);
+      await loadBars();
+      notify(
+        "ok",
+        `"${res.branchName}" lista para producción: ${res.deletedOrderItems} ítem(s) de prueba purgados y ${res.openingLedgerSnapshots} insumo(s) conservados con saldo inicial limpio.`,
+      );
+    } catch (err) {
+      haptics.blocked();
+      setPurgeError(err instanceof Error ? err.message : "No se pudo ejecutar la purga");
+    } finally {
+      setPurgeExecuting(false);
+    }
+  };
 
   const notify = (kind: "ok" | "err", text: string) => {
     setNotice({ kind, text });
@@ -474,6 +605,57 @@ export function SuperAdminDashboard({
                         </div>
                       </div>
                     </div>
+
+                    {/* Sucursales activas con botón de Puesta en Producción (Purga de pruebas) */}
+                    {bar.approvalStatus === "approved" && bar.branches && bar.branches.length > 0 && (
+                      <div className="mt-4 border-t border-white/10 pt-3">
+                        <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          Sucursales · Puesta en Producción (Go-Live)
+                        </p>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {bar.branches.map((br) => (
+                            <div
+                              key={br.id}
+                              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-background/60 px-3 py-2"
+                            >
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="truncate text-xs font-bold text-foreground">
+                                    {br.name}
+                                  </span>
+                                  <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] font-bold text-primary">
+                                    {br.code}
+                                  </span>
+                                </div>
+                                {br.operationalGoLiveAt ? (
+                                  <p className="mt-0.5 flex items-center gap-1 text-[10px] text-success">
+                                    <ShieldCheck className="h-3 w-3 shrink-0" />
+                                    En producción desde{" "}
+                                    {new Date(br.operationalGoLiveAt).toLocaleDateString("es-CO", {
+                                      day: "2-digit",
+                                      month: "short",
+                                      year: "numeric",
+                                    })}
+                                  </p>
+                                ) : (
+                                  <p className="mt-0.5 text-[10px] text-muted-foreground">
+                                    Fase de montaje / pruebas
+                                  </p>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => void openPurgeModal(bar.name, br)}
+                                className="press-response flex min-h-9 items-center gap-1.5 rounded-xl bg-warning/15 px-3 text-[11px] font-bold text-warning ring-1 ring-warning/35 hover:bg-warning/25"
+                              >
+                                <Rocket className="h-3.5 w-3.5" />
+                                Purgar pruebas
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </article>
                 );
               })}
@@ -481,6 +663,258 @@ export function SuperAdminDashboard({
           )}
         </div>
       </main>
+
+      {/* Modal SuperAdmin: Puesta en Producción / Purga de Datos de Prueba */}
+      {purgeTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 backdrop-blur-sm sm:items-center sm:p-4"
+          onClick={() => !purgeExecuting && setPurgeTarget(null)}
+        >
+          <div
+            className="material-thick safe-bottom flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl border border-warning/35 sm:rounded-3xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-warning/15 text-warning">
+                  <Rocket className="h-5 w-5" />
+                </div>
+                <div>
+                  <h2 className="font-display text-base font-bold sm:text-lg">
+                    Puesta en Producción · {purgeTarget.branch.name}
+                  </h2>
+                  <p className="text-xs text-muted-foreground">
+                    {purgeTarget.barName} · Código{" "}
+                    <strong className="font-mono text-foreground">{purgeTarget.branch.code}</strong>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={purgeExecuting}
+                onClick={() => setPurgeTarget(null)}
+                className="press-response flex h-10 w-10 items-center justify-center rounded-xl bg-secondary text-foreground"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-4 overflow-y-auto p-5">
+              {purgeLoading ? (
+                <div className="rounded-2xl bg-background/60 p-6 text-center text-xs text-muted-foreground">
+                  Calculando registros de prueba y catálogo a conservar...
+                </div>
+              ) : purgePreview ? (
+                <>
+                  {/* Resumen comparativo: qué se purga vs qué se conserva */}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-destructive/35 bg-destructive/8 p-3.5 text-xs">
+                      <p className="mb-2 flex items-center gap-1.5 font-bold uppercase tracking-wider text-destructive">
+                        <AlertTriangle className="h-4 w-4" />
+                        Se purgará (pruebas)
+                      </p>
+                      <ul className="space-y-1 text-muted-foreground tabular-nums">
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toDelete.orderItems}</strong>{" "}
+                          líneas de venta / comanda ({purgePreview.toDelete.tableSessions} sesiones)
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toDelete.payments}</strong>{" "}
+                          pagos y abonos registrados
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toDelete.cashShifts}</strong>{" "}
+                          turnos ·{" "}
+                          <strong className="text-foreground">{purgePreview.toDelete.cashExpenses}</strong>{" "}
+                          egresos ·{" "}
+                          <strong className="text-foreground">{purgePreview.toDelete.cashExtras}</strong>{" "}
+                          adicionales
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toDelete.debtorsToReset}</strong>{" "}
+                          saldos fiados ({formatCOP(purgePreview.toDelete.totalPendingDebtToReset)} → $0)
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toDelete.allySettlements}</strong>{" "}
+                          liquidaciones de aliados ·{" "}
+                          <strong className="text-foreground">{purgePreview.toDelete.inventoryLedgerEntries}</strong>{" "}
+                          movimientos kardex de prueba
+                        </li>
+                      </ul>
+                    </div>
+
+                    <div className="rounded-2xl border border-success/35 bg-success/8 p-3.5 text-xs">
+                      <p className="mb-2 flex items-center gap-1.5 font-bold uppercase tracking-wider text-success">
+                        <ShieldCheck className="h-4 w-4" />
+                        Se conservará intacto
+                      </p>
+                      <ul className="space-y-1 text-muted-foreground tabular-nums">
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toPreserve.menuProducts}</strong>{" "}
+                          productos ·{" "}
+                          <strong className="text-foreground">{purgePreview.toPreserve.presentations}</strong>{" "}
+                          presentaciones y recetas
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toPreserve.inventoryItems}</strong>{" "}
+                          insumos de inventario y stock
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toPreserve.categories}</strong>{" "}
+                          categorías ·{" "}
+                          <strong className="text-foreground">{purgePreview.toPreserve.promotions}</strong>{" "}
+                          promociones ·{" "}
+                          <strong className="text-foreground">{purgePreview.toPreserve.allies}</strong>{" "}
+                          aliados
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toPreserve.diningTables}</strong>{" "}
+                          mesas ·{" "}
+                          <strong className="text-foreground">{purgePreview.toPreserve.paymentMethods}</strong>{" "}
+                          medios de pago
+                        </li>
+                        <li>
+                          <strong className="text-foreground">{purgePreview.toPreserve.users}</strong>{" "}
+                          usuarios/permisos ·{" "}
+                          <strong className="text-foreground">{purgePreview.toPreserve.customers}</strong>{" "}
+                          clientes (en $0)
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  {/* Selector de comportamiento del Stock */}
+                  <div className="space-y-2">
+                    <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                      ¿Cómo manejar el Stock actual?
+                    </p>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <button
+                        type="button"
+                        onClick={() => setPurgeStockMode("keep_current_stock")}
+                        className={`press-response rounded-2xl border p-3 text-left ${
+                          purgeStockMode === "keep_current_stock"
+                            ? "border-primary bg-primary/15"
+                            : "border-white/10 bg-background/60"
+                        }`}
+                      >
+                        <p className="text-xs font-bold text-foreground">
+                          Mantener stock exacto de hoy
+                        </p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          Recomendado si ya contaron inventario físico. Crea 1 saldo inicial limpio
+                          por insumo.
+                        </p>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPurgeStockMode("restore_test_sales")}
+                        className={`press-response rounded-2xl border p-3 text-left ${
+                          purgeStockMode === "restore_test_sales"
+                            ? "border-primary bg-primary/15"
+                            : "border-white/10 bg-background/60"
+                        }`}
+                      >
+                        <p className="text-xs font-bold text-foreground">
+                          Revertir ventas de prueba al stock
+                        </p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          Devuelve lo descontado por ventas de prueba (
+                          {purgePreview.toDelete.itemsWithTestSales} insumo(s) afectados) antes de
+                          fijar el saldo inicial.
+                        </p>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Base inicial + Confirmación de seguridad */}
+                  <div className="space-y-3 rounded-2xl border border-white/10 bg-background/60 p-4">
+                    <div>
+                      <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                        Base inicial de efectivo para el primer turno real (COP)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={purgeOpeningFloat}
+                        onChange={(e) => setPurgeOpeningFloat(e.target.value)}
+                        className="w-full rounded-xl border border-white/15 bg-card px-3 py-2 text-sm font-bold tabular-nums"
+                      />
+                    </div>
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label className="mb-1 block text-xs font-semibold text-muted-foreground">
+                          Escribe el código{" "}
+                          <strong className="font-mono text-warning">
+                            {purgeTarget.branch.code}
+                          </strong>{" "}
+                          para confirmar *
+                        </label>
+                        <input
+                          type="text"
+                          placeholder={purgeTarget.branch.code}
+                          value={purgeConfirmCode}
+                          onChange={(e) => {
+                            setPurgeConfirmCode(e.target.value);
+                            setPurgeError(null);
+                          }}
+                          className="w-full rounded-xl border border-white/15 bg-card px-3 py-2 font-mono text-sm font-bold uppercase"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 flex items-center gap-1 text-xs font-semibold text-muted-foreground">
+                          <Lock className="h-3.5 w-3.5" />
+                          Contraseña SuperAdmin *
+                        </label>
+                        <input
+                          type="password"
+                          placeholder="Tu contraseña de SuperAdmin"
+                          value={purgePassword}
+                          onChange={(e) => {
+                            setPurgePassword(e.target.value);
+                            setPurgeError(null);
+                          }}
+                          className="w-full rounded-xl border border-white/15 bg-card px-3 py-2 text-sm"
+                        />
+                      </div>
+                    </div>
+
+                    {purgeError && (
+                      <p className="rounded-xl bg-destructive/15 px-3 py-2 text-xs font-semibold text-destructive">
+                        {purgeError}
+                      </p>
+                    )}
+
+                    <button
+                      type="button"
+                      disabled={
+                        purgeExecuting ||
+                        purgeConfirmCode.trim().toUpperCase() !==
+                          purgeTarget.branch.code.trim().toUpperCase() ||
+                        !purgePassword
+                      }
+                      onClick={() => void handleExecutePurge()}
+                      className="press-response flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-destructive px-4 text-sm font-bold text-white disabled:opacity-45"
+                    >
+                      <Rocket className="h-4 w-4" />
+                      {purgeExecuting
+                        ? "Purgando datos de prueba..."
+                        : `Purgar Pruebas e Iniciar Producción (${purgeTarget.branch.code})`}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                purgeError && (
+                  <p className="rounded-xl bg-destructive/15 px-3 py-2 text-xs font-semibold text-destructive">
+                    {purgeError}
+                  </p>
+                )
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

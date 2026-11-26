@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import {
+  buildComboPresentationForExplosion,
+  computeComboTemplatePrice,
   DEFAULT_BRANCH_FEATURE_FLAGS,
   evaluateLinePromotion,
   evaluateSubAccountPromotion,
@@ -9,6 +11,7 @@ import {
   isPromotionEligibleAt,
   type Ally,
   type Branch,
+  type ComboTemplate,
   type Customer,
   type InventoryItem,
   type MenuCategory,
@@ -31,12 +34,24 @@ import {
 import { syncEngine } from "./sync-engine.js";
 import { getCurrentIsoDayAndTime } from "../../shared/lib/format.js";
 
+export interface ActiveShiftSnapshot {
+  id: string;
+  openingFloat: number;
+  expectedOpeningFloat?: number;
+  openingDiscrepancy?: number;
+  openedAt: string;
+  status: string;
+  hoursOpen?: number;
+  isExpired24h?: boolean;
+}
+
 interface BootstrapResponse {
   serverTime: string;
   branch: Branch;
   users: LocalBranchUser[];
   diningTables: LocalDiningTable[];
-  activeShift: { id: string; openingFloat: number; openedAt: string; status: string } | null;
+  activeShift: ActiveShiftSnapshot | null;
+  lastClosedCashLeft?: number;
   categories: MenuCategory[];
   menuProducts: MenuProduct[];
   presentations: ProductPresentation[];
@@ -45,7 +60,9 @@ interface BootstrapResponse {
   allies: Ally[];
   customers: Customer[];
   paymentMethods: PaymentMethod[];
+  treasuryAccounts?: PaymentMethod[];
   promotionRules: PromotionRule[];
+  comboTemplates?: ComboTemplate[];
   openTableSessions: LocalTableSession[];
   openSubAccounts: LocalSubAccount[];
   openOrderItems: OrderItemLine[];
@@ -74,6 +91,8 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
   const [loading, setLoading] = useState(true);
   const activeUserId = authenticatedUserId;
   const [lastHydratedAt, setLastHydratedAt] = useState<string | null>(null);
+  const [activeShift, setActiveShift] = useState<ActiveShiftSnapshot | null>(null);
+  const [lastClosedCashLeft, setLastClosedCashLeft] = useState<number>(0);
 
   const hydrateFromServer = useCallback(async () => {
     try {
@@ -82,6 +101,8 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
       const pending = await syncEngine.refreshPendingCount();
 
       const data = await apiFetch<BootstrapResponse>(`/api/v1/branches/${branchId}/bootstrap`);
+      setActiveShift(data.activeShift ?? null);
+      setLastClosedCashLeft(Number(data.lastClosedCashLeft ?? 0));
 
       await localDb.transaction(
         "rw",
@@ -97,7 +118,9 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
           localDb.allies,
           localDb.customers,
           localDb.paymentMethods,
+          localDb.treasuryAccounts,
           localDb.promotionRules,
+          localDb.comboTemplates,
           localDb.tableSessions,
           localDb.subAccounts,
           localDb.orderItems,
@@ -124,8 +147,12 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
           await localDb.customers.bulkPut(data.customers);
           await localDb.paymentMethods.where("branchId").equals(branchId).delete();
           await localDb.paymentMethods.bulkPut(data.paymentMethods);
+          await localDb.treasuryAccounts.where("branchId").equals(branchId).delete();
+          await localDb.treasuryAccounts.bulkPut(data.treasuryAccounts ?? data.paymentMethods);
           await localDb.promotionRules.where("branchId").equals(branchId).delete();
           await localDb.promotionRules.bulkPut(data.promotionRules);
+          await localDb.comboTemplates.where("branchId").equals(branchId).delete();
+          await localDb.comboTemplates.bulkPut(data.comboTemplates ?? []);
 
           // Only replace open tables/orders when outbox is clean to avoid overwriting offline drafts
           if (pending === 0) {
@@ -148,11 +175,28 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
 
   useEffect(() => {
     void hydrateFromServer();
-    const unsubRemote = syncEngine.onRemoteChange(() => {
+    const unsubRemote = syncEngine.onRemoteChange((eventType) => {
+      if (eventType === "OPERATIONS_PURGED") {
+        void (async () => {
+          await localDb.transaction(
+            "rw",
+            [localDb.syncOutbox, localDb.tableSessions, localDb.subAccounts, localDb.orderItems],
+            async () => {
+              await localDb.syncOutbox.where("branchId").equals(branchId).delete();
+              await localDb.tableSessions.where("branchId").equals(branchId).delete();
+              await localDb.subAccounts.where("branchId").equals(branchId).delete();
+              await localDb.orderItems.clear();
+            },
+          );
+          await syncEngine.refreshPendingCount();
+          await hydrateFromServer();
+        })();
+        return;
+      }
       void hydrateFromServer();
     });
     return unsubRemote;
-  }, [hydrateFromServer]);
+  }, [branchId, hydrateFromServer]);
 
   const branch = useLiveQuery(() => localDb.branches.get(branchId), [branchId]);
   const users = useLiveQuery(() => localDb.branchUsers.toArray(), []) ?? [];
@@ -195,9 +239,19 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
       () => localDb.paymentMethods.where("branchId").equals(branchId).sortBy("sortOrder"),
       [branchId],
     ) ?? [];
+  const treasuryAccounts =
+    useLiveQuery(
+      () => localDb.treasuryAccounts.where("branchId").equals(branchId).sortBy("sortOrder"),
+      [branchId],
+    ) ?? [];
   const promotionRules =
     useLiveQuery(
       () => localDb.promotionRules.where("branchId").equals(branchId).sortBy("priority"),
+      [branchId],
+    ) ?? [];
+  const comboTemplates =
+    useLiveQuery(
+      () => localDb.comboTemplates.where("branchId").equals(branchId).toArray(),
       [branchId],
     ) ?? [];
   const tableSessions =
@@ -226,10 +280,12 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
   // === LOCAL-FIRST ATOMIC POS COMMANDS (<16ms UI + IndexedDB Outbox + Async Sync) ===
 
   const openTableSession = useCallback(
-    async (diningTableId: string | null, label = "Cuenta 1") => {
+    async (diningTableId: string | null, label = "Cuenta 1", description?: string | null) => {
       const tableSessionId = generateUuidV7();
       const subAccountId = generateUuidV7();
       const nowIso = new Date().toISOString();
+      const cleanLabel = label.trim() || "Cuenta 1";
+      const cleanDesc = description?.trim() || null;
 
       await localDb.transaction(
         "rw",
@@ -247,7 +303,8 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
             id: subAccountId,
             branchId,
             tableSessionId,
-            label,
+            label: cleanLabel,
+            description: cleanDesc,
             status: "open",
             subtotalAmount: 0,
             discountAmount: 0,
@@ -261,7 +318,13 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
             branchId,
             userId: activeUserId,
             commandType: "OPEN_TABLE_SESSION",
-            payload: { tableSessionId, diningTableId, subAccountId, label },
+            payload: {
+              tableSessionId,
+              diningTableId,
+              subAccountId,
+              label: cleanLabel,
+              description: cleanDesc,
+            },
           });
         },
       );
@@ -273,16 +336,19 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
   );
 
   const createSubAccount = useCallback(
-    async (tableSessionId: string, label: string) => {
+    async (tableSessionId: string, label: string, description?: string | null) => {
       const subAccountId = generateUuidV7();
       const nowIso = new Date().toISOString();
+      const cleanLabel = label.trim() || "Cuenta nueva";
+      const cleanDesc = description?.trim() || null;
 
       await localDb.transaction("rw", [localDb.subAccounts, localDb.syncOutbox], async () => {
         await localDb.subAccounts.put({
           id: subAccountId,
           branchId,
           tableSessionId,
-          label,
+          label: cleanLabel,
+          description: cleanDesc,
           status: "open",
           subtotalAmount: 0,
           discountAmount: 0,
@@ -296,12 +362,44 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
           branchId,
           userId: activeUserId,
           commandType: "CREATE_SUB_ACCOUNT",
-          payload: { subAccountId, tableSessionId, label },
+          payload: { subAccountId, tableSessionId, label: cleanLabel, description: cleanDesc },
         });
       });
 
       void syncEngine.flushOutbox(branchId);
       return subAccountId;
+    },
+    [branchId, activeUserId],
+  );
+
+  const updateSubAccount = useCallback(
+    async (subAccountId: string, patch: { label?: string; description?: string | null }) => {
+      const sub = await localDb.subAccounts.get(subAccountId);
+      if (!sub) return;
+      const cleanLabel = patch.label !== undefined ? patch.label.trim() || sub.label : sub.label;
+      const hasDesc = "description" in patch;
+      const cleanDesc = hasDesc ? (patch.description?.trim() || null) : (sub.description ?? null);
+
+      await localDb.transaction("rw", [localDb.subAccounts, localDb.syncOutbox], async () => {
+        await localDb.subAccounts.update(subAccountId, {
+          label: cleanLabel,
+          description: cleanDesc,
+          version: sub.version + 1,
+          updatedAt: new Date().toISOString(),
+        });
+        await enqueueOfflineCommand({
+          branchId,
+          userId: activeUserId,
+          commandType: "UPDATE_SUB_ACCOUNT",
+          payload: {
+            subAccountId,
+            label: cleanLabel,
+            ...(hasDesc ? { description: cleanDesc } : {}),
+          },
+        });
+      });
+
+      void syncEngine.flushOutbox(branchId);
     },
     [branchId, activeUserId],
   );
@@ -353,7 +451,9 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
             } else if (mode === "void_items") {
               for (const item of activeItems) {
                 await localDb.orderItems.update(item.id, { status: "voided" });
-                const pres = await localDb.presentations.get(item.presentationId);
+                const pres = item.presentationId
+                  ? await localDb.presentations.get(item.presentationId)
+                  : undefined;
                 if (pres) {
                   const explosion = explodePresentationSale({
                     productKind: item.productKindSnap,
@@ -420,35 +520,57 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
       presentation: ProductPresentation,
       quantity = 1,
       forcedPromotionRuleId?: string | null,
+      comboTemplate?: ComboTemplate | null,
     ) => {
       const orderItemId = generateUuidV7();
       const { isoDay, hhmm, yyyymmdd } = getCurrentIsoDayAndTime();
+      const unitPrice = comboTemplate
+        ? computeComboTemplatePrice(comboTemplate, presentation.salePrice)
+        : presentation.salePrice;
+      const comboBaseQty = Math.max(1, comboTemplate?.baseQuantity ?? 1);
+      const effectivePresentationName = comboTemplate
+        ? `${comboBaseQty > 1 ? `${comboBaseQty}× ` : ""}${presentation.name} + ${comboTemplate.shortLabel || comboTemplate.name}`
+        : presentation.name;
+      const effectiveProductKind = comboTemplate ? "combo" : product.productKind;
+      const effectiveAllyId = comboTemplate?.allyId ?? presentation.allyId ?? product.allyId ?? null;
+      const effectiveAllyPayout = comboTemplate?.allyId
+        ? comboTemplate.allyPayoutAmount
+        : presentation.allyPayoutAmount;
 
-      const promoRes = featureFlags.enablePromotions
-        ? evaluateLinePromotion({
-            line: {
-              categoryId: product.categoryId,
-              menuProductId: product.id,
-              presentationId: presentation.id,
-              presentationGroup: presentation.presentationGroup,
-              unitPrice: presentation.salePrice,
-              quantity,
-            },
-            rules: promotionRules,
-            isoDayOfWeek: isoDay,
-            currentTimeHHMM: hhmm,
-            currentDateYYYYMMDD: yyyymmdd,
-            forcedRuleId: forcedPromotionRuleId ?? null,
-          })
-        : {
-            promotionRuleId: null,
-            discountAmount: 0,
-            netTotal: presentation.salePrice * quantity,
-          };
+      const promoRes =
+        !comboTemplate && featureFlags.enablePromotions
+          ? evaluateLinePromotion({
+              line: {
+                categoryId: product.categoryId,
+                menuProductId: product.id,
+                presentationId: presentation.id,
+                presentationGroup: presentation.presentationGroup,
+                unitPrice,
+                quantity,
+              },
+              rules: promotionRules,
+              isoDayOfWeek: isoDay,
+              currentTimeHHMM: hhmm,
+              currentDateYYYYMMDD: yyyymmdd,
+              forcedRuleId: forcedPromotionRuleId ?? null,
+            })
+          : {
+              promotionRuleId: null,
+              discountAmount: 0,
+              netTotal: unitPrice * quantity,
+            };
 
+      const basePresForExplosion: ProductPresentation = {
+        ...presentation,
+        salePrice: unitPrice,
+        allyId: effectiveAllyId,
+        allyPayoutAmount: effectiveAllyPayout,
+      };
       const explosion = explodePresentationSale({
-        productKind: product.productKind,
-        presentation,
+        productKind: effectiveProductKind,
+        presentation: comboTemplate
+          ? buildComboPresentationForExplosion(basePresForExplosion, comboTemplate)
+          : basePresForExplosion,
         quantity,
         applyFoamLossFormula: featureFlags.enableFoamLossFormula,
       });
@@ -470,16 +592,17 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
             presentationId: presentation.id,
             categoryId: product.categoryId,
             productNameSnap: product.name,
-            presentationNameSnap: presentation.name,
+            presentationNameSnap: effectivePresentationName,
             presentationGroupSnap: presentation.presentationGroup,
-            productKindSnap: product.productKind,
+            productKindSnap: effectiveProductKind,
             quantity,
-            unitPriceSnap: presentation.salePrice,
-            allyIdSnap: presentation.allyId ?? product.allyId ?? null,
-            allyPayoutSnap: presentation.allyPayoutAmount,
+            unitPriceSnap: unitPrice,
+            allyIdSnap: effectiveAllyId,
+            allyPayoutSnap: effectiveAllyPayout,
             promotionRuleId: promoRes.promotionRuleId,
             discountAmount: promoRes.discountAmount,
             lineTotal: promoRes.netTotal,
+            adjustmentReason: comboTemplate ? `Combo: ${comboTemplate.name}` : null,
             status: "active",
           });
 
@@ -504,14 +627,15 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
                   (i) =>
                     i.status === "active" &&
                     !i.adjustmentReason &&
+                    Boolean(i.menuProductId && i.presentationId && i.categoryId) &&
                     !(i.promotionRuleId && manualRuleIds.has(i.promotionRuleId)),
                 )
                 .toArray();
               const lineInputs = activeItems.map((i) => ({
                 id: i.id,
-                categoryId: i.categoryId,
-                menuProductId: i.menuProductId,
-                presentationId: i.presentationId,
+                categoryId: i.categoryId!,
+                menuProductId: i.menuProductId!,
+                presentationId: i.presentationId!,
                 presentationGroup: i.presentationGroupSnap,
                 unitPrice: i.unitPriceSnap,
                 quantity: i.quantity,
@@ -554,6 +678,7 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
               presentationId: presentation.id,
               quantity,
               ...(forcedPromotionRuleId ? { forcedPromotionRuleId } : {}),
+              ...(comboTemplate ? { comboTemplateId: comboTemplate.id } : {}),
             },
           });
         },
@@ -565,12 +690,96 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
     [branchId, activeUserId, featureFlags, promotionRules],
   );
 
+  const addCustomCharge = useCallback(
+    async (
+      subAccountId: string,
+      input: {
+        description: string;
+        amount: number;
+        categoryLabel?: string;
+        quantity?: number;
+      },
+    ) => {
+      const orderItemId = generateUuidV7();
+      const description = input.description.trim();
+      const categoryLabel = input.categoryLabel?.trim() || "Cargo adicional";
+      const quantity = Math.max(1, Math.round(input.quantity ?? 1));
+      const unitAmount = Math.round(input.amount * 100) / 100;
+      if (!description || !Number.isFinite(unitAmount) || unitAmount <= 0) return null;
+      const lineTotal = Math.round(unitAmount * quantity * 100) / 100;
+
+      await localDb.transaction(
+        "rw",
+        [localDb.orderItems, localDb.subAccounts, localDb.syncOutbox],
+        async () => {
+          await localDb.orderItems.put({
+            id: orderItemId,
+            subAccountId,
+            menuProductId: null,
+            presentationId: null,
+            categoryId: null,
+            productNameSnap: description,
+            presentationNameSnap: categoryLabel,
+            presentationGroupSnap: "otro",
+            productKindSnap: "standard",
+            quantity,
+            unitPriceSnap: unitAmount,
+            allyIdSnap: null,
+            allyPayoutSnap: 0,
+            promotionRuleId: null,
+            discountAmount: 0,
+            lineTotal,
+            adjustmentReason: categoryLabel,
+            status: "active",
+          });
+
+          await recalcLocalSubAccount(subAccountId);
+
+          await enqueueOfflineCommand({
+            branchId,
+            userId: activeUserId,
+            commandType: "ADD_CUSTOM_CHARGE",
+            payload: {
+              orderItemId,
+              subAccountId,
+              description,
+              categoryLabel,
+              amount: unitAmount,
+              quantity,
+            },
+          });
+        },
+      );
+
+      void syncEngine.flushOutbox(branchId);
+      return orderItemId;
+    },
+    [branchId, activeUserId],
+  );
+
+  const renameDiningTable = useCallback(
+    async (tableId: string, label: string) => {
+      const cleaned = label.trim();
+      if (!cleaned) throw new Error("Escribe un nombre para la mesa.");
+      const updated = await apiFetch<{ id: string; label: string; zone: string }>(
+        `/api/v1/branches/${branchId}/tables/${tableId}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ label: cleaned }),
+        },
+      );
+      await localDb.diningTables.update(tableId, { label: updated.label });
+      return updated;
+    },
+    [branchId],
+  );
+
   const voidOrderItem = useCallback(
     async (orderItemId: string, reason = "Anulado en POS") => {
       const item = await localDb.orderItems.get(orderItemId);
       if (!item) return;
 
-      const pres = await localDb.presentations.get(item.presentationId);
+      const pres = item.presentationId ? await localDb.presentations.get(item.presentationId) : undefined;
 
       await localDb.transaction(
         "rw",
@@ -684,15 +893,20 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
           const activeItems = await localDb.orderItems
             .where("subAccountId")
             .equals(subAccountId)
-            .filter((i) => i.status === "active" && !i.adjustmentReason)
+            .filter(
+              (i) =>
+                i.status === "active" &&
+                !i.adjustmentReason &&
+                Boolean(i.menuProductId && i.presentationId && i.categoryId),
+            )
             .toArray();
           const preview = evaluateSubAccountPromotion(
             rule,
             activeItems.map((i) => ({
               id: i.id,
-              categoryId: i.categoryId,
-              menuProductId: i.menuProductId,
-              presentationId: i.presentationId,
+              categoryId: i.categoryId!,
+              menuProductId: i.menuProductId!,
+              presentationId: i.presentationId!,
               presentationGroup: i.presentationGroupSnap,
               unitPrice: i.unitPriceSnap,
               quantity: i.quantity,
@@ -834,7 +1048,11 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
     allies,
     customers,
     paymentMethods,
+    treasuryAccounts,
     promotionRules,
+    comboTemplates,
+    activeShift,
+    lastClosedCashLeft,
     tableSessions,
     subAccounts,
     orderItems,
@@ -842,8 +1060,11 @@ export function useLiquiStock(branchId: string, authenticatedUserId: string) {
     refresh: hydrateFromServer,
     openTableSession,
     createSubAccount,
+    updateSubAccount,
     deleteSubAccount,
     addOrderItem,
+    addCustomCharge,
+    renameDiningTable,
     voidOrderItem,
     moveOrderItem,
     adjustOrderItemPrice,

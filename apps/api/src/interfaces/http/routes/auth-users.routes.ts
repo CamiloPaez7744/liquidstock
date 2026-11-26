@@ -10,6 +10,7 @@ import {
 import { hashSecret, verifySecret } from "../../../infrastructure/auth/crypto.js";
 import { signAuthToken } from "../../../infrastructure/auth/jwt.js";
 import { db, withTransaction } from "../../../infrastructure/db/pool.js";
+import { branchHub } from "../../../infrastructure/realtime/branch-hub.js";
 
 // Lightweight in-memory brute-force protection for login endpoints (10 failures / 5 min per key)
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -633,7 +634,41 @@ export async function registerAuthAndUsersRoutes(app: FastifyInstance) {
          o.created_at DESC`,
     );
 
-    const bars = barsRes.rows;
+    const branchesRes = await db.query<{
+      id: string;
+      organizationId: string;
+      name: string;
+      code: string;
+      operationalGoLiveAt: string | null;
+    }>(
+      `SELECT id, organization_id AS "organizationId", name, code,
+              operational_go_live_at AS "operationalGoLiveAt"
+       FROM branches
+       WHERE is_active = true
+       ORDER BY created_at ASC`,
+    );
+
+    const branchesByOrg = new Map<string, Array<{
+      id: string;
+      name: string;
+      code: string;
+      operationalGoLiveAt: string | null;
+    }>>();
+    for (const br of branchesRes.rows) {
+      const list = branchesByOrg.get(br.organizationId) ?? [];
+      list.push({
+        id: br.id,
+        name: br.name,
+        code: br.code,
+        operationalGoLiveAt: br.operationalGoLiveAt,
+      });
+      branchesByOrg.set(br.organizationId, list);
+    }
+
+    const bars = barsRes.rows.map((b) => ({
+      ...b,
+      branches: branchesByOrg.get(b.id) ?? [],
+    }));
     const counts = {
       pending: bars.filter((b) => b.approvalStatus === "pending_approval").length,
       approved: bars.filter((b) => b.approvalStatus === "approved").length,
@@ -644,6 +679,314 @@ export async function registerAuthAndUsersRoutes(app: FastifyInstance) {
     };
 
     return { bars, counts };
+  });
+
+  // Preview counts before SuperAdmin Go-Live operational purge (preserves catalog, stock, tables, users)
+  app.get("/api/v1/superadmin/branches/:branchId/purge-preview", async (request, reply) => {
+    const auth = await requireSuperAdmin(request, reply);
+    if (!auth) return;
+
+    const { branchId } = request.params as { branchId: string };
+    const brRes = await db.query<{
+      id: string;
+      name: string;
+      code: string;
+      operationalGoLiveAt: string | null;
+      organizationName: string;
+    }>(
+      `SELECT b.id, b.name, b.code,
+              b.operational_go_live_at AS "operationalGoLiveAt",
+              o.name AS "organizationName"
+       FROM branches b
+       JOIN organizations o ON o.id = b.organization_id
+       WHERE b.id = $1 AND b.is_active = true`,
+      [branchId],
+    );
+    const branch = brRes.rows[0];
+    if (!branch) return reply.status(404).send({ error: "BRANCH_NOT_FOUND" });
+
+    const [
+      orderItemsRes,
+      sessionsRes,
+      paymentsRes,
+      creditRes,
+      debtRes,
+      alliesSettleRes,
+      expensesRes,
+      extrasRes,
+      shiftsRes,
+      ledgerRes,
+      testSalesLedgerRes,
+      catalogRes,
+      infraRes,
+    ] = await Promise.all([
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM order_items WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM table_sessions WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM payments WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM customer_credit_ledger WHERE branch_id = $1`, [branchId]),
+      db.query<{ debtors: string; total_debt: string }>(
+        `SELECT COUNT(*) FILTER (WHERE current_debt > 0)::text AS debtors,
+                COALESCE(SUM(current_debt), 0)::text AS total_debt
+         FROM customers WHERE branch_id = $1`,
+        [branchId],
+      ),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM ally_settlement_entries WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM cash_expenses WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM cash_extras WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM cash_shifts WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM inventory_ledger WHERE branch_id = $1`, [branchId]),
+      db.query<{ cnt: string }>(
+        `SELECT COUNT(DISTINCT inventory_item_id)::text AS cnt
+         FROM inventory_ledger
+         WHERE branch_id = $1 AND movement_type IN ('sale', 'sale_void_reversal')`,
+        [branchId],
+      ),
+      db.query<{ categories: string; products: string; presentations: string; inventory: string }>(
+        `SELECT
+           (SELECT COUNT(*)::text FROM categories WHERE branch_id = $1 AND is_active = true) AS categories,
+           (SELECT COUNT(*)::text FROM menu_products WHERE branch_id = $1) AS products,
+           (SELECT COUNT(*)::text FROM product_presentations WHERE branch_id = $1) AS presentations,
+           (SELECT COUNT(*)::text FROM inventory_items WHERE branch_id = $1 AND is_active = true) AS inventory`,
+        [branchId],
+      ),
+      db.query<{ tables: string; methods: string; promos: string; allies: string; customers: string; users: string }>(
+        `SELECT
+           (SELECT COUNT(*)::text FROM dining_tables WHERE branch_id = $1 AND is_active = true) AS tables,
+           (SELECT COUNT(*)::text FROM payment_methods WHERE branch_id = $1 AND is_active = true) AS methods,
+           (SELECT COUNT(*)::text FROM promotion_rules WHERE branch_id = $1) AS promos,
+           (SELECT COUNT(*)::text FROM allies WHERE branch_id = $1 AND is_active = true) AS allies,
+           (SELECT COUNT(*)::text FROM customers WHERE branch_id = $1) AS customers,
+           (SELECT COUNT(*)::text FROM branch_memberships WHERE branch_id = $1 AND is_active = true) AS users`,
+        [branchId],
+      ),
+    ]);
+
+    return {
+      branch,
+      toDelete: {
+        orderItems: Number(orderItemsRes.rows[0]?.cnt ?? "0"),
+        tableSessions: Number(sessionsRes.rows[0]?.cnt ?? "0"),
+        payments: Number(paymentsRes.rows[0]?.cnt ?? "0"),
+        creditLedgerEntries: Number(creditRes.rows[0]?.cnt ?? "0"),
+        debtorsToReset: Number(debtRes.rows[0]?.debtors ?? "0"),
+        totalPendingDebtToReset: Number(debtRes.rows[0]?.total_debt ?? "0"),
+        allySettlements: Number(alliesSettleRes.rows[0]?.cnt ?? "0"),
+        cashExpenses: Number(expensesRes.rows[0]?.cnt ?? "0"),
+        cashExtras: Number(extrasRes.rows[0]?.cnt ?? "0"),
+        cashShifts: Number(shiftsRes.rows[0]?.cnt ?? "0"),
+        inventoryLedgerEntries: Number(ledgerRes.rows[0]?.cnt ?? "0"),
+        itemsWithTestSales: Number(testSalesLedgerRes.rows[0]?.cnt ?? "0"),
+      },
+      toPreserve: {
+        categories: Number(catalogRes.rows[0]?.categories ?? "0"),
+        menuProducts: Number(catalogRes.rows[0]?.products ?? "0"),
+        presentations: Number(catalogRes.rows[0]?.presentations ?? "0"),
+        inventoryItems: Number(catalogRes.rows[0]?.inventory ?? "0"),
+        diningTables: Number(infraRes.rows[0]?.tables ?? "0"),
+        paymentMethods: Number(infraRes.rows[0]?.methods ?? "0"),
+        promotions: Number(infraRes.rows[0]?.promos ?? "0"),
+        allies: Number(infraRes.rows[0]?.allies ?? "0"),
+        customers: Number(infraRes.rows[0]?.customers ?? "0"),
+        users: Number(infraRes.rows[0]?.users ?? "0"),
+      },
+    };
+  });
+
+  // SuperAdmin-only Go-Live operational purge: wipes test sales/payments/shifts/debts while preserving
+  // catalog, recipes, tables, users, and inventory items/stock.
+  app.post("/api/v1/superadmin/branches/:branchId/purge-operations", async (request, reply) => {
+    const auth = await requireSuperAdmin(request, reply);
+    if (!auth) return;
+
+    const { branchId } = request.params as { branchId: string };
+    const parsed = z
+      .object({
+        confirmBranchCode: z.string().trim().min(1),
+        superAdminPassword: z.string().min(1),
+        stockMode: z.enum(["keep_current_stock", "restore_test_sales"]).default("keep_current_stock"),
+        openingFloat: z.number().min(0).default(0),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "INVALID_PURGE_REQUEST",
+        message: "Completa el código de sucursal y tu contraseña de SuperAdmin.",
+        issues: parsed.error.issues,
+      });
+    }
+
+    const brRes = await db.query<{ id: string; name: string; code: string }>(
+      `SELECT id, name, code FROM branches WHERE id = $1 AND is_active = true`,
+      [branchId],
+    );
+    const branch = brRes.rows[0];
+    if (!branch) return reply.status(404).send({ error: "BRANCH_NOT_FOUND" });
+
+    if (parsed.data.confirmBranchCode.toUpperCase() !== branch.code.trim().toUpperCase()) {
+      return reply.status(400).send({
+        error: "CONFIRMATION_MISMATCH",
+        message: `El código no coincide. Debes escribir exactamente "${branch.code}".`,
+      });
+    }
+
+    const superUserRes = await db.query<{ password_hash: string | null }>(
+      `SELECT password_hash FROM users WHERE id = $1 AND is_super_admin = true AND is_active = true`,
+      [auth.userId],
+    );
+    const pwdOk = await verifySecret(
+      parsed.data.superAdminPassword,
+      superUserRes.rows[0]?.password_hash ?? null,
+    );
+    if (!pwdOk) {
+      return reply.status(401).send({
+        error: "INVALID_SUPERADMIN_PASSWORD",
+        message: "Contraseña de SuperAdmin incorrecta.",
+      });
+    }
+
+    const result = await withTransaction(async (client) => {
+      // Transaction-local authorization for append-only ledger deletion
+      await client.query(`SELECT set_config('liquistock.allow_superadmin_purge', 'true', true)`);
+
+      let restoredItemsCount = 0;
+      if (parsed.data.stockMode === "restore_test_sales") {
+        // Sum net stock delta from test sales/void reversals (negative for net deductions)
+        const saleDeltas = await client.query<{ inventory_item_id: string; net_delta: string }>(
+          `SELECT inventory_item_id, COALESCE(SUM(quantity_delta_base), 0)::text AS net_delta
+           FROM inventory_ledger
+           WHERE branch_id = $1 AND movement_type IN ('sale', 'sale_void_reversal')
+           GROUP BY inventory_item_id`,
+          [branchId],
+        );
+        for (const row of saleDeltas.rows) {
+          const netDelta = Number(row.net_delta);
+          if (Math.abs(netDelta) > 0.0001) {
+            const invRes = await client.query<{ current_stock_base: string }>(
+              `SELECT current_stock_base::text FROM inventory_items WHERE id = $1 AND branch_id = $2 FOR UPDATE`,
+              [row.inventory_item_id, branchId],
+            );
+            if (invRes.rows[0]) {
+              const current = Number(invRes.rows[0].current_stock_base);
+              const restored = Math.max(0, Math.round((current - netDelta) * 1000) / 1000);
+              await client.query(
+                `UPDATE inventory_items SET current_stock_base = $2, updated_at = now() WHERE id = $1`,
+                [row.inventory_item_id, restored],
+              );
+              restoredItemsCount += 1;
+            }
+          }
+        }
+      }
+
+      // Delete transactional data in strict FK-safe order
+      await client.query(
+        `DELETE FROM order_item_transfers
+         WHERE order_item_id IN (SELECT id FROM order_items WHERE branch_id = $1)`,
+        [branchId],
+      );
+      await client.query(`DELETE FROM ally_settlement_entries WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM customer_credit_ledger WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM payments WHERE branch_id = $1`, [branchId]);
+      const deletedOrders = await client.query(`DELETE FROM order_items WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM sub_accounts WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM table_sessions WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM cash_transfers WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM supplier_payments WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM supplier_payables WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM cash_expenses WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM cash_extras WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM cash_shifts WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM inventory_ledger WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM alert_events WHERE branch_id = $1`, [branchId]);
+      await client.query(`DELETE FROM sync_processed_events WHERE branch_id = $1`, [branchId]);
+
+      // Keep customer directory & whitelist/blacklist statuses, reset test debts to 0
+      await client.query(
+        `UPDATE customers SET current_debt = 0, updated_at = now() WHERE branch_id = $1`,
+        [branchId],
+      );
+
+      // Write 1 clean Go-Live opening Kardex snapshot per active inventory item with stock > 0
+      const activeItems = await client.query<{
+        id: string;
+        current_stock_base: string;
+        avg_unit_cost_base: string;
+      }>(
+        `SELECT id, current_stock_base::text, avg_unit_cost_base::text
+         FROM inventory_items
+         WHERE branch_id = $1 AND is_active = true`,
+        [branchId],
+      );
+      let openingLedgerSnapshots = 0;
+      for (const item of activeItems.rows) {
+        const stock = Number(item.current_stock_base);
+        if (stock > 0) {
+          await client.query(
+            `INSERT INTO inventory_ledger (
+               id, branch_id, inventory_item_id, movement_type,
+               quantity_delta_base, nominal_qty_base, pour_loss_qty_base,
+               stock_after_base, unit_cost_base, reference_type, reference_id,
+               reason, created_by, idempotency_key
+             ) VALUES (
+               $1, $2, $3, 'manual_adjustment',
+               $4, $4, 0,
+               $4, $5, 'go_live_opening_balance', NULL,
+               $6, $7, $8
+             )`,
+            [
+              generateUuidV7(),
+              branchId,
+              item.id,
+              stock,
+              Number(item.avg_unit_cost_base),
+              "Saldo inicial puesta en producción",
+              auth.userId,
+              generateUuidV7(),
+            ],
+          );
+          openingLedgerSnapshots += 1;
+        }
+      }
+
+      // Open a brand-new clean cash shift ready for production launch
+      const newShiftId = generateUuidV7();
+      await client.query(
+        `INSERT INTO cash_shifts (id, branch_id, opened_by, status, opening_float, notes)
+         VALUES ($1, $2, $3, 'open', $4, 'Turno inicial puesta en producción')`,
+        [newShiftId, branchId, auth.userId, parsed.data.openingFloat],
+      );
+
+      const goLiveRes = await client.query<{ operational_go_live_at: string }>(
+        `UPDATE branches SET operational_go_live_at = now() WHERE id = $1 RETURNING operational_go_live_at`,
+        [branchId],
+      );
+
+      return {
+        branchId,
+        branchName: branch.name,
+        branchCode: branch.code,
+        stockMode: parsed.data.stockMode,
+        deletedOrderItems: deletedOrders.rowCount ?? 0,
+        restoredItemsCount,
+        openingLedgerSnapshots,
+        newShiftId,
+        operationalGoLiveAt: goLiveRes.rows[0]?.operational_go_live_at ?? new Date().toISOString(),
+      };
+    });
+
+    // Tell all connected POS tablets in this branch to clear stale test sessions & re-hydrate cleanly
+    branchHub.broadcast({
+      type: "OPERATIONS_PURGED",
+      branchId,
+      originDeviceId: "superadmin",
+      timestamp: new Date().toISOString(),
+      payload: {
+        stockMode: result.stockMode,
+        newShiftId: result.newShiftId,
+      },
+    });
+
+    return result;
   });
 
   app.patch("/api/v1/superadmin/bars/:orgId/status", async (request, reply) => {
